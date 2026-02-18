@@ -23,7 +23,6 @@ if not PLAYLIST_URL:
     raise RuntimeError("Please set PLAYLIST_URL environment variable")
 METADATA = {}
 
-# Simple thread-safe cache for yt-dlp JSON outputs
 _CACHE_LOCK = threading.Lock()
 try:
     if os.path.exists(YTDLP_CACHE_FILE):
@@ -84,7 +83,6 @@ def fetch_metadata(index, url):
         cached = _CACHE.get(url)
     if cached:
         try:
-            # cached may be the full yt-dlp JSON dict
             data = cached
             METADATA[index] = {
                 "title": data.get("title", f"Track {index+1}"),
@@ -112,7 +110,6 @@ def fetch_metadata(index, url):
             "artist": data.get("uploader", "Unknown"),
             "duration": data.get("duration", -1)
         }
-        # store full json in cache
         with _CACHE_LOCK:
             _CACHE[url] = data
             try:
@@ -121,7 +118,6 @@ def fetch_metadata(index, url):
                 logger.exception("Failed to persist cache after fetching %s", url)
         logger.debug("Fetched metadata for index %s: %s", index, METADATA[index])
     except Exception:
-        # Fallback defaults
         METADATA[index] = {
             "title": f"Track {index+1}",
             "artist": "Unknown",

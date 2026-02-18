@@ -1,5 +1,5 @@
 # yt-playlist-radio
-Simple demo of YouTube playlist to m3u playlist, all in about 100 lines of Python.
+Simple demo of YouTube playlist to m3u playlist, all in about 200 lines of Python.
 
 ## How to run?
 First set the environment variables as per `.env.template`, then just run it with gunicorn or something else (gunicorn comes bundled as part of the deps here)
