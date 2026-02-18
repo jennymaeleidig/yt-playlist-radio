@@ -6,9 +6,12 @@ import threading
 import random
 import os
 from dotenv import load_dotenv
+import logging
 
-# Load .env first
 load_dotenv()
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
@@ -47,18 +50,22 @@ def fetch_metadata(index, url):
             "artist": data.get("uploader", "Unknown"),
             "duration": data.get("duration", -1)
         }
+        logger.debug("Fetched metadata for index %s: %s", index, METADATA[index])
     except Exception:
         METADATA[index] = {
             "title": f"Track {index+1}",
             "artist": "Unknown",
             "duration": -1
         }
+        logger.debug("Failed to fetch metadata for index %s, using fallback", index)
 
 PLAYLIST = convert_playlist_to_links(PLAYLIST_URL)
 for i, url in enumerate(PLAYLIST):
     threading.Thread(target=fetch_metadata, args=(i, url), daemon=True).start()
 print(f"Playlist loaded: {len(PLAYLIST)} tracks")
+logger.info("Playlist loaded: %d tracks", len(PLAYLIST))
 print(f"OK. Now serving, you can access the m3u at {BASE_URL}/playlist.m3u")
+logger.info("OK. Now serving, you can access the m3u at %s/playlist.m3u", BASE_URL)
 
 
 #  FLASK ROUTES
@@ -80,6 +87,13 @@ def track(index):
     if index < 0 or index >= len(PLAYLIST):
         abort(404)
 
+    meta = METADATA.get(index, {
+        "title": f"Track {index+1}",
+        "artist": "Unknown",
+        "duration": -1
+    })
+    logger.info("Now playing index %d: %s - %s (%s)", index, meta["artist"], meta["title"], PLAYLIST[index])
+
     process = subprocess.Popen(
         ["yt-dlp", "-f", "bestaudio", "-o", "-", PLAYLIST[index]],
         stdout=subprocess.PIPE,
@@ -94,7 +108,11 @@ def track(index):
                     break
                 yield chunk
         finally:
-            process.kill()
+            try:
+                process.kill()
+            except Exception:
+                pass
+            logger.info("Finished playing index %d: %s - %s", index, meta["artist"], meta["title"])
 
     return Response(stream_with_context(stream()), mimetype="audio/mpeg")
 
