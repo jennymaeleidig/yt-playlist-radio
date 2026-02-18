@@ -1,4 +1,4 @@
-from flask import Flask, Response, stream_with_context, abort
+from flask import Flask, Response, stream_with_context, jsonify
 from yt_dlp import YoutubeDL
 import subprocess
 import json
@@ -7,6 +7,7 @@ import random
 import os
 from dotenv import load_dotenv
 import logging
+import time
 
 load_dotenv()
 
@@ -15,18 +16,21 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
+BITRATE_KBPS = int(os.environ.get("BITRATE_KBPS", "192"))
+BURST_SECONDS = int(os.environ.get("BURST_SECONDS", "10"))
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000")
 PLAYLIST_URL = os.environ.get("PLAYLIST_URL")
-RANDOMIZE_PLAYLIST = os.environ.get("RANDOMIZE_PLAYLIST", "False").lower() in ("1", "true", "yes")
-YTDLP_CACHE_FILE = os.environ.get("YTDLP_CACHE_FILE", "yt_dlp_cache.json")
+CACHE_FILE = os.environ.get("CACHE_FILE", "cache.json")
 if not PLAYLIST_URL:
     raise RuntimeError("Please set PLAYLIST_URL environment variable")
+
 METADATA = {}
+NOW_PLAYING = {"index": None, "title": "Nothing", "artist": "Unknown", "url": ""}
 
 _CACHE_LOCK = threading.Lock()
 try:
-    if os.path.exists(YTDLP_CACHE_FILE):
-        with open(YTDLP_CACHE_FILE, "r", encoding="utf-8") as f:
+    if os.path.exists(CACHE_FILE):
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
             _CACHE = json.load(f)
     else:
         _CACHE = {}
@@ -34,25 +38,20 @@ except Exception:
     logger.exception("Failed to load cache file, starting with empty cache")
     _CACHE = {}
 
+
 def _save_cache():
-    # atomic write
-    tmp = f"{YTDLP_CACHE_FILE}.tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(_CACHE, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, YTDLP_CACHE_FILE)
-    except Exception:
-        logger.exception("Failed to save cache to %s", YTDLP_CACHE_FILE)
+    with _CACHE_LOCK:
         try:
-            if os.path.exists(tmp):
-                os.remove(tmp)
+            with open(CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(_CACHE, f, ensure_ascii=False, indent=2)
         except Exception:
-            pass
+            logger.exception("Failed to save cache to %s", CACHE_FILE)
+
 
 def convert_playlist_to_links(link: str):
     ydl_opts = {
         "quiet": True,
-        "extract_flat": True,   # don't download, just metadata
+        "extract_flat": True,
     }
     urls = []
     with YoutubeDL(ydl_opts) as ydl:
@@ -73,34 +72,29 @@ def convert_playlist_to_links(link: str):
                 urls.append(entry_id)
             else:
                 urls.append(f"https://www.youtube.com/watch?v={entry_id}")
-    if RANDOMIZE_PLAYLIST:
-        random.shuffle(urls)
     return urls
 
+
 def fetch_metadata(index, url):
-    cached = None
     with _CACHE_LOCK:
         cached = _CACHE.get(url)
     if cached:
         try:
-            data = cached
             METADATA[index] = {
-                "title": data.get("title", f"Track {index+1}"),
-                "artist": data.get("uploader", "Unknown"),
-                "duration": data.get("duration", -1)
+                "title": cached.get("title", f"Track {index+1}"),
+                "artist": cached.get("uploader", "Unknown"),
+                "duration": cached.get("duration", -1),
             }
-            logger.debug("Loaded metadata from cache for index %s: %s", index, METADATA[index])
             return
         except Exception:
             logger.exception("Failed to use cached metadata for %s, will refetch", url)
 
-    # Not cached or failed to use cache: call yt-dlp to dump json
     try:
         result = subprocess.run(
             ["yt-dlp", "--dump-json", url],
             capture_output=True,
             text=True,
-            timeout=30
+            timeout=30,
         )
         if result.returncode != 0 or not result.stdout:
             raise RuntimeError(f"yt-dlp failed for {url}: {result.stderr.strip()}")
@@ -108,79 +102,166 @@ def fetch_metadata(index, url):
         METADATA[index] = {
             "title": data.get("title", f"Track {index+1}"),
             "artist": data.get("uploader", "Unknown"),
-            "duration": data.get("duration", -1)
+            "duration": data.get("duration", -1),
         }
         with _CACHE_LOCK:
-            _CACHE[url] = data
-            try:
-                _save_cache()
-            except Exception:
-                logger.exception("Failed to persist cache after fetching %s", url)
-        logger.debug("Fetched metadata for index %s: %s", index, METADATA[index])
+            _CACHE[url] = {
+                "title": data.get("title"),
+                "uploader": data.get("uploader"),
+                "duration": data.get("duration"),
+            }
+        _save_cache()
     except Exception:
         METADATA[index] = {
             "title": f"Track {index+1}",
             "artist": "Unknown",
-            "duration": -1
+            "duration": -1,
         }
         logger.debug("Failed to fetch metadata for index %s, using fallback", index)
 
+
 PLAYLIST = convert_playlist_to_links(PLAYLIST_URL)
-for i, url in enumerate(PLAYLIST):
-    threading.Thread(target=fetch_metadata, args=(i, url), daemon=True).start()
-print(f"Playlist loaded: {len(PLAYLIST)} tracks")
-logger.info("Playlist loaded: %d tracks", len(PLAYLIST))
-print(f"OK. Now serving, you can access the m3u at {BASE_URL}/playlist.m3u")
-logger.info("OK. Now serving, you can access the m3u at %s/playlist.m3u", BASE_URL)
+PRELOAD_COUNT = min(4, len(PLAYLIST))
+_preload_indices = random.sample(range(len(PLAYLIST)), PRELOAD_COUNT) if PLAYLIST else []
+for i in _preload_indices:
+    threading.Thread(target=fetch_metadata, args=(i, PLAYLIST[i]), daemon=True).start()
+logger.info("Playlist loaded: %d tracks (preloading %d)", len(PLAYLIST), PRELOAD_COUNT)
+logger.info("Stream available at %s/stream", BASE_URL)
+logger.info("M3U available at %s/playlist.m3u", BASE_URL)
 
 
-#  FLASK ROUTES
-@app.route("/playlist.m3u")
-def playlist_route():
-    lines = ["#EXTM3U"]
-    for i, url in enumerate(PLAYLIST):
-        meta = METADATA.get(i, {
-            "title": f"Track {i+1}",
-            "artist": "Unknown",
-            "duration": -1
-        })
-        lines.append(f"#EXTINF:{meta['duration']},{meta['artist']} - {meta['title']}")
-        lines.append(f"{BASE_URL}/track/{i}")
-    return Response("\n".join(lines), mimetype="audio/x-mpegurl")
+def _ensure_metadata(index):
+    """Fetch metadata for a track if not already loaded. Called before playback."""
+    if index not in METADATA:
+        fetch_metadata(index, PLAYLIST[index])
 
-@app.route("/track/<int:index>")
-def track(index):
-    if index < 0 or index >= len(PLAYLIST):
-        abort(404)
 
-    meta = METADATA.get(index, {
-        "title": f"Track {index+1}",
-        "artist": "Unknown",
-        "duration": -1
-    })
-    logger.info("Now playing index %d: %s - %s (%s)", index, meta["artist"], meta["title"], PLAYLIST[index])
+def _stream_track(index):
+    url = PLAYLIST[index]
+    _ensure_metadata(index)
+    meta = METADATA.get(index, {"title": f"Track {index+1}", "artist": "Unknown", "duration": -1})
 
-    process = subprocess.Popen(
-        ["yt-dlp", "-f", "bestaudio", "-o", "-", PLAYLIST[index]],
+    NOW_PLAYING["index"] = index
+    NOW_PLAYING["title"] = meta["title"]
+    NOW_PLAYING["artist"] = meta["artist"]
+    NOW_PLAYING["url"] = url
+    logger.info("Now playing [%d/%d]: %s - %s", index + 1, len(PLAYLIST), meta["artist"], meta["title"])
+
+    ytdlp = subprocess.Popen(
+        ["yt-dlp", "-f", "bestaudio", "-o", "-", url],
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL
+        stderr=subprocess.DEVNULL,
     )
 
-    def stream():
-        try:
-            while True:
-                chunk = process.stdout.read(8192)
-                if not chunk:
-                    break
-                yield chunk
-        finally:
-            try:
-                process.kill()
-            except Exception:
-                pass
-            logger.info("Finished playing index %d: %s - %s", index, meta["artist"], meta["title"])
+    ffmpeg = subprocess.Popen(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-i", "pipe:0",
+            "-f", "mp3",
+            "-ab", f"{BITRATE_KBPS}k",
+            "-ar", "44100",
+            "-ac", "2",
+            "pipe:1",
+        ],
+        stdin=ytdlp.stdout,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    ytdlp.stdout.close()
 
-    return Response(stream_with_context(stream()), mimetype="audio/mpeg")
+    bytes_per_sec = (BITRATE_KBPS * 1000) // 8
+    burst_bytes = bytes_per_sec * BURST_SECONDS
+    bytes_sent = 0
+    start_time = time.monotonic()
+
+    try:
+        while True:
+            chunk = ffmpeg.stdout.read(8192)
+            if not chunk:
+                break
+            bytes_sent += len(chunk)
+            yield chunk
+
+            elapsed = time.monotonic() - start_time
+            expected_bytes = elapsed * bytes_per_sec + burst_bytes
+            if bytes_sent > expected_bytes:
+                sleep_for = (bytes_sent - expected_bytes) / bytes_per_sec
+                time.sleep(sleep_for)
+    finally:
+        try:
+            ffmpeg.kill()
+        except Exception:
+            pass
+        try:
+            ytdlp.kill()
+        except Exception:
+            pass
+        ffmpeg.wait()
+        ytdlp.wait()
+        logger.info("Finished sending [%d/%d]: %s - %s", index + 1, len(PLAYLIST), meta["artist"], meta["title"])
+
+
+@app.route("/playlist.m3u")
+def playlist_route():
+    lines = [
+        "#EXTM3U",
+        f"#EXTINF:-1,Infinite Radio",
+        f"{BASE_URL}/stream",
+    ]
+    return Response("\n".join(lines), mimetype="audio/x-mpegurl")
+
+
+@app.route("/stream")
+def stream():
+    def generate():
+        played = []
+        while True:
+            if not PLAYLIST:
+                logger.error("Playlist is empty, cannot stream")
+                break
+
+            available = [i for i in range(len(PLAYLIST)) if i not in played]
+            if not available:
+                played.clear()
+                available = list(range(len(PLAYLIST)))
+
+            index = random.choice(available)
+            played.append(index)
+
+            try:
+                yield from _stream_track(index)
+            except GeneratorExit:
+                logger.info("Client disconnected")
+                return
+            except Exception:
+                logger.exception("Error streaming track %d, skipping", index)
+                time.sleep(1)
+                continue
+
+    return Response(stream_with_context(generate()), mimetype="audio/mpeg")
+
+
+@app.route("/now_playing")
+def now_playing():
+    return jsonify(NOW_PLAYING)
+
+
+@app.route("/tracks")
+def tracks():
+    track_list = []
+    for i, url in enumerate(PLAYLIST):
+        meta = METADATA.get(i, {"title": f"Track {i+1}", "artist": "Unknown", "duration": -1})
+        track_list.append({
+            "index": i,
+            "title": meta["title"],
+            "artist": meta["artist"],
+            "duration": meta["duration"],
+            "url": url,
+        })
+    return jsonify(track_list)
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, threaded=True)
