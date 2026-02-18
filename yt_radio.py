@@ -18,9 +18,37 @@ app = Flask(__name__)
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000")
 PLAYLIST_URL = os.environ.get("PLAYLIST_URL")
 RANDOMIZE_PLAYLIST = os.environ.get("RANDOMIZE_PLAYLIST", "False").lower() in ("1", "true", "yes")
+YTDLP_CACHE_FILE = os.environ.get("YTDLP_CACHE_FILE", "yt_dlp_cache.json")
 if not PLAYLIST_URL:
     raise RuntimeError("Please set PLAYLIST_URL environment variable")
 METADATA = {}
+
+# Simple thread-safe cache for yt-dlp JSON outputs
+_CACHE_LOCK = threading.Lock()
+try:
+    if os.path.exists(YTDLP_CACHE_FILE):
+        with open(YTDLP_CACHE_FILE, "r", encoding="utf-8") as f:
+            _CACHE = json.load(f)
+    else:
+        _CACHE = {}
+except Exception:
+    logger.exception("Failed to load cache file, starting with empty cache")
+    _CACHE = {}
+
+def _save_cache():
+    # atomic write
+    tmp = f"{YTDLP_CACHE_FILE}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_CACHE, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, YTDLP_CACHE_FILE)
+    except Exception:
+        logger.exception("Failed to save cache to %s", YTDLP_CACHE_FILE)
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
 
 def convert_playlist_to_links(link: str):
     ydl_opts = {
@@ -30,28 +58,70 @@ def convert_playlist_to_links(link: str):
     urls = []
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(link, download=False)
-        for entry in info["entries"]:
-            urls.append(f"https://www.youtube.com/watch?v={entry['id']}")
+        entries = info.get("entries") if isinstance(info, dict) else None
+        if not entries:
+            logger.warning("No entries found in playlist info for %s", link)
+            return urls
+        for entry in entries:
+            entry_id = None
+            if isinstance(entry, dict):
+                entry_id = entry.get("id") or entry.get("url")
+            elif isinstance(entry, str):
+                entry_id = entry
+            if not entry_id:
+                continue
+            if entry_id.startswith("http"):
+                urls.append(entry_id)
+            else:
+                urls.append(f"https://www.youtube.com/watch?v={entry_id}")
     if RANDOMIZE_PLAYLIST:
         random.shuffle(urls)
     return urls
 
 def fetch_metadata(index, url):
+    cached = None
+    with _CACHE_LOCK:
+        cached = _CACHE.get(url)
+    if cached:
+        try:
+            # cached may be the full yt-dlp JSON dict
+            data = cached
+            METADATA[index] = {
+                "title": data.get("title", f"Track {index+1}"),
+                "artist": data.get("uploader", "Unknown"),
+                "duration": data.get("duration", -1)
+            }
+            logger.debug("Loaded metadata from cache for index %s: %s", index, METADATA[index])
+            return
+        except Exception:
+            logger.exception("Failed to use cached metadata for %s, will refetch", url)
+
+    # Not cached or failed to use cache: call yt-dlp to dump json
     try:
         result = subprocess.run(
             ["yt-dlp", "--dump-json", url],
             capture_output=True,
             text=True,
-            timeout=20
+            timeout=30
         )
+        if result.returncode != 0 or not result.stdout:
+            raise RuntimeError(f"yt-dlp failed for {url}: {result.stderr.strip()}")
         data = json.loads(result.stdout)
         METADATA[index] = {
             "title": data.get("title", f"Track {index+1}"),
             "artist": data.get("uploader", "Unknown"),
             "duration": data.get("duration", -1)
         }
+        # store full json in cache
+        with _CACHE_LOCK:
+            _CACHE[url] = data
+            try:
+                _save_cache()
+            except Exception:
+                logger.exception("Failed to persist cache after fetching %s", url)
         logger.debug("Fetched metadata for index %s: %s", index, METADATA[index])
     except Exception:
+        # Fallback defaults
         METADATA[index] = {
             "title": f"Track {index+1}",
             "artist": "Unknown",
