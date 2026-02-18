@@ -7,16 +7,16 @@ import random
 import os
 from dotenv import load_dotenv
 
+# Load .env first
 load_dotenv()
 
 app = Flask(__name__)
 
-PLAYLIST = [
-]
-
-BASE_URL = os.environ.get("BASE_URL")
+BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000")
 PLAYLIST_URL = os.environ.get("PLAYLIST_URL")
-RANDOMIZE_PLAYLIST = os.environ.get("RANDOMIZE_PLAYLIST")
+RANDOMIZE_PLAYLIST = os.environ.get("RANDOMIZE_PLAYLIST", "False").lower() in ("1", "true", "yes")
+if not PLAYLIST_URL:
+    raise RuntimeError("Please set PLAYLIST_URL environment variable")
 METADATA = {}
 
 def convert_playlist_to_links(link: str):
@@ -29,7 +29,7 @@ def convert_playlist_to_links(link: str):
         info = ydl.extract_info(link, download=False)
         for entry in info["entries"]:
             urls.append(f"https://www.youtube.com/watch?v={entry['id']}")
-    if bool(RANDOMIZE_PLAYLIST) == True:
+    if RANDOMIZE_PLAYLIST:
         random.shuffle(urls)
     return urls
 
@@ -54,31 +54,26 @@ def fetch_metadata(index, url):
             "duration": -1
         }
 
-
+PLAYLIST = convert_playlist_to_links(PLAYLIST_URL)
 for i, url in enumerate(PLAYLIST):
     threading.Thread(target=fetch_metadata, args=(i, url), daemon=True).start()
+print(f"Playlist loaded: {len(PLAYLIST)} tracks")
+print(f"OK. Now serving, you can access the m3u at {BASE_URL}/playlist.m3u")
 
 
+#  FLASK ROUTES
 @app.route("/playlist.m3u")
-def playlist():
+def playlist_route():
     lines = ["#EXTM3U"]
-
-    indices = list(range(len(PLAYLIST)))
-
-    for i in indices:
+    for i, url in enumerate(PLAYLIST):
         meta = METADATA.get(i, {
             "title": f"Track {i+1}",
             "artist": "Unknown",
             "duration": -1
         })
-
-        lines.append(
-            f"#EXTINF:{meta['duration']},{meta['artist']} - {meta['title']}"
-        )
+        lines.append(f"#EXTINF:{meta['duration']},{meta['artist']} - {meta['title']}")
         lines.append(f"{BASE_URL}/track/{i}")
-
-    return Response("\n".join(lines),
-                    mimetype="audio/x-mpegurl")
+    return Response("\n".join(lines), mimetype="audio/x-mpegurl")
 
 @app.route("/track/<int:index>")
 def track(index):
@@ -101,13 +96,7 @@ def track(index):
         finally:
             process.kill()
 
-    return Response(
-        stream_with_context(stream()),
-        mimetype="audio/mpeg"
-    )
+    return Response(stream_with_context(stream()), mimetype="audio/mpeg")
 
-
-if not PLAYLIST_URL:
-    print("ERROR: Please set PLAYLIST_URL environment variable")
-PLAYLIST = convert_playlist_to_links(PLAYLIST_URL)
-print(f"OK. Now serving, you can access the m3u at {BASE_URL}/playlist.m3u")
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8000, threaded=True)
