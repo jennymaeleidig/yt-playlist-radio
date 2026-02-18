@@ -5,7 +5,6 @@ import json
 import threading
 import random
 import os
-import sys
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -16,6 +15,7 @@ PLAYLIST = [
 ]
 
 BASE_URL = os.environ.get("BASE_URL")
+PLAYLIST_URL = os.environ.get("PLAYLIST_URL")
 RANDOMIZE_PLAYLIST = os.environ.get("RANDOMIZE_PLAYLIST")
 METADATA = {}
 
@@ -107,12 +107,7 @@ def track(index):
     )
 
 
-if __name__ == "__main__":
-    if len(sys.argv) <= 1:
-        print("ERROR: Specify link to YouTube playlist")
-    playlist_url = sys.argv[1]
-    print("Converting Playlist to YouTube Links")
-    PLAYLIST = convert_playlist_to_links(playlist_url)
-    print(PLAYLIST)
-    print(f"OK. Now serving, you can access the m3u at {BASE_URL}/playlist.m3u")
-    app.run(host="0.0.0.0", port=8000, threaded=True)
+if not PLAYLIST_URL:
+    print("ERROR: Please set PLAYLIST_URL environment variable")
+PLAYLIST = convert_playlist_to_links(PLAYLIST_URL)
+print(f"OK. Now serving, you can access the m3u at {BASE_URL}/playlist.m3u")
