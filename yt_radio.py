@@ -148,7 +148,7 @@ def _ensure_metadata(index):
 def _stream_track(index):
     url = PLAYLIST[index]
     _ensure_metadata(index)
-    meta = METADATA.get(index, {"title": f"Track {index+1}", "artist": "Unknown", "duration": -1})
+    meta = METADATA.get(index, {"title": f"Track {index+1}", "artist": "Unknown", "duration": -1, "id": ""})
 
     NOW_PLAYING["index"] = index
     NOW_PLAYING["title"] = meta["title"]
