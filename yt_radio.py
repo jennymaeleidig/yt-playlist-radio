@@ -23,6 +23,7 @@ BURST_SECONDS = int(os.environ.get("BURST_SECONDS", "10")) # allow pre-buffering
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000")
 PLAYLIST_URL = os.environ.get("PLAYLIST_URL")
 CACHE_FILE = os.environ.get("CACHE_FILE", "cache.json")
+RANDOMIZE_PLAYLIST = bool(os.environ.get("RANDOMIZE_PLAYLIST", "false"))
 
 # optional / page
 SITE_TITLE = os.environ.get("SITE_TITLE", "yt_radio.py")
@@ -296,12 +297,31 @@ def home():
 
 @app.route("/playlist.m3u")
 def playlist_route():
-    lines = [
-        "#EXTM3U",
-        f"#EXTINF:-1,Infinite Radio",
-        f"{BASE_URL}/stream",
-    ]
-    return Response("\n".join(lines), mimetype="audio/x-mpegurl")
+    if not PLAYLIST:
+        return Response("#EXTM3U\n", mimetype="audio/x-mpegurl")
+    indices = list(range(len(PLAYLIST)))
+    if RANDOMIZE_PLAYLIST:
+        random.shuffle(indices)
+
+    lines = ["#EXTM3U"]
+    for i in indices:
+        try:
+            _ensure_metadata(i)
+        except Exception:
+            logger.debug("Failed to ensure metadata for index %s", i)
+
+        meta = METADATA.get(i, {})
+        title = meta.get("title", f"Track {i+1}")
+        artist = meta.get("artist", "Unknown")
+        duration = meta.get("duration", -1)
+        try:
+            duration_int = int(duration) if isinstance(duration, (int, float, str)) and str(duration).isdigit() else int(duration) if isinstance(duration, int) else -1
+        except Exception:
+            duration_int = -1
+        lines.append(f"#EXTINF:{duration_int},{artist} - {title}")
+        lines.append(PLAYLIST[i])
+    body = "\n".join(lines) + "\n"
+    return Response(body, mimetype="audio/x-mpegurl")
 
 
 @app.route("/stream")
