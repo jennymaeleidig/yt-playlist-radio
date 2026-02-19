@@ -12,3 +12,6 @@ uv run gunicorn yt_radio:app --bind 0.0.0.0:8000 -k gthread --threads 50 --worke
 
 > Note that `--timeout 0` is a strict requirement if using `/stream` endpoint due to Gunicorn's default timeout policy
 > Similarly, you should use a single persistent worker if you want everyone listening to the same stuff on `/stream`
+
+## Example Landing Page
+<img width="936" height="992" alt="image" src="https://github.com/user-attachments/assets/e70879ad-bdff-46b0-8018-130211d950a1" />
