@@ -91,6 +91,7 @@ def fetch_metadata(index, url):
                 "title": cached.get("title", f"Track {index+1}"),
                 "artist": cached.get("uploader", "Unknown"),
                 "duration": cached.get("duration", -1),
+                "id": cached.get("id", ""),
             }
             return
         except Exception:
@@ -151,10 +152,10 @@ def _stream_track(index):
     meta = METADATA.get(index, {"title": f"Track {index+1}", "artist": "Unknown", "duration": -1, "id": ""})
 
     NOW_PLAYING["index"] = index
-    NOW_PLAYING["title"] = meta["title"]
-    NOW_PLAYING["artist"] = meta["artist"]
-    NOW_PLAYING["id"] = meta["id"]
-    logger.info("Now playing [%d/%d]: %s - %s", index + 1, len(PLAYLIST), meta["artist"], meta["title"])
+    NOW_PLAYING["title"] = meta.get("title", "")
+    NOW_PLAYING["artist"] = meta.get("artist", "")
+    NOW_PLAYING["id"] = meta.get("id", "")
+    logger.info("Now playing [%d/%d]: %s - %s", index + 1, len(PLAYLIST), meta.get("artist", ""), meta.get("title", ""))
 
     ytdlp = subprocess.Popen(
         ["yt-dlp", "-f", "bestaudio", "-o", "-", url],
