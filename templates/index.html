@@ -1,44 +1,452 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
+  <meta charset="utf-8" />
   <title>{{ title }}</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
+    :root {
+      --bg: #0f1220;
+      --card: #0b0d14;
+      --muted: #9aa0c7;
+      --accent: #cfe0ff;
+      --btn-bg: #141826;
+    }
     html, body {
       height: 100%;
       margin: 0;
-      font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Arial, sans-serif;
-      background: #0f1220;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+      background: var(--bg);
       color: #e8eaf6;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
     }
+
     .center {
       min-height: 100%;
       display: grid;
       place-items: center;
-      text-align: center;
-      padding: 16px;
+      padding: 18px;
+      box-sizing: border-box;
+      padding-bottom: 84px;
     }
-    img {
-      max-width: 90vw;
-      height: auto;
+
+    .player {
+      width: 100%;
+      max-width: 720px;
+      padding: 12px;
+    }
+
+    img.cover {
+      width: 300px;
+      height: 300px;
+      object-fit: cover;
       display: block;
       margin: 0 auto 12px;
+      border-radius: 6px;
+      background: var(--card);
     }
-    h1 {
-      margin: 0;
-      font-size: clamp(1.5rem, 4vw, 2.5rem);
-      font-weight: 500;
+
+    h1 { margin: 0 0 6px 0; font-size: clamp(1.5rem, 4vw, 2rem); font-weight: 500; text-align:center; }
+    .artist { margin-top: 6px; color: var(--muted); font-size: 0.95rem; text-align:center; }
+
+    /* visualizer */
+    .viz-wrap { position: relative; width: 100%; margin-bottom: 6px; }
+    canvas#visualizer {
+      width: 100%;
+      height: 84px;
+      display: block;
+      margin: 12px auto 8px;
+      border-radius: 6px;
+      background: rgba(255,255,255,0.02);
     }
+
+    /* overlays */
+    .viz-overlay {
+      position: absolute;
+      top: 8px;
+      padding: 6px 10px;
+      border-radius: 6px;
+      background: rgba(0,0,0,0.12);
+      color: #e8eaf6;
+      font-weight: 600;
+      font-size: 0.9rem;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .viz-top-left { left: 8px; }
+    .viz-top-right { right: 8px; }
+
+    /* hide native audio element */
+    audio#radio-audio { display: none; }
+
+    /* controls
+       Updated layout:
+       - left-aligned latency + resync grouped
+       - status on the right
+       - responsive spacing so items remain aligned and don't overlap
+    */
+    .controls-row {
+      display: flex;
+      gap: 12px;
+      justify-content: space-between;
+      align-items: center;
+      margin-top: 12px;
+      width: 100%;
+      box-sizing: border-box;
+      padding: 0 6px;
+    }
+
+    /* compact group for latency + resync */
+    .control-group {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+    }
+    /* allow stacking when narrow */
+    .control-stack {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 6px;
+    }
+
+    .btn {
+      background: var(--btn-bg);
+      color: #e8eaf6;
+      border: 1px solid rgba(255,255,255,0.04);
+      padding: 8px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    .btn:active { transform: translateY(1px); }
+
+    /* volume range */
+    input[type="range"] {
+      appearance: none;
+      width: 120px;
+      height: 6px;
+      background: rgba(255,255,255,0.06);
+      border-radius: 6px;
+      outline: none;
+    }
+    input[type="range"]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background: #e8eaf6;
+      border: 2px solid var(--bg);
+      cursor: pointer;
+    }
+
+    .small-muted { color: var(--muted); font-size: 0.9rem; }
+
+    /* latency fixed width, monospace (avoid shift)
+       reduced min-width and left-aligned for better alignment with Resync button
+    */
+    .latency-display {
+      color: var(--accent);
+      font-weight: 700;
+      font-size: 0.9rem;
+      display: inline-block;
+      min-width: 84px;
+      text-align: left;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, 'Roboto Mono', monospace;
+    }
+
+    /* status area */
+    .status-space {
+      min-width: 100px;
+      text-align: right;
+      color: var(--muted);
+      font-weight: 600;
+      font-size: 0.9rem;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* responsive breakpoint: stack controls on narrow screens */
+    @media (max-width: 520px) {
+      .controls-row { flex-direction: column; align-items: stretch; gap: 8px; margin-top: 10px; }
+      /* stack latency + resync vertically on narrow screens for better touch targets */
+      .control-group { flex-direction: column; align-items: center; gap: 8px; }
+      .status-space { text-align: center; min-width: 0; }
+    }
+
+    /* fixed footer */
+    footer.fixed-footer {
+      position: fixed;
+      left: 0; right: 0; bottom: 0;
+      height: 64px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      background: linear-gradient(to top, rgba(6,8,12,0.80), rgba(6,8,12,0.10));
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+      box-sizing: border-box;
+      padding: 10px 14px;
+      z-index: 60;
+    }
+
+    .route-code {
+      display: inline-block;
+      background: rgba(255,255,255,0.03);
+      padding: 6px 10px;
+      border-radius: 6px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, 'Roboto Mono', monospace;
+      font-size: 0.9rem;
+      color: var(--accent);
+      border: 1px solid rgba(255,255,255,0.03);
+      margin: 0 6px;
+    }
+
+    /* tiny status space */
+    .status-space { min-width: 90px; text-align:center; color: var(--muted); font-weight:600; font-size:0.9rem; }
+
+    /* make canvas sharper on some displays */
+    canvas#visualizer { image-rendering: -webkit-optimize-contrast; }
   </style>
-  <script src="https://unpkg.com/htmx.org@1.9.10"></script>
 </head>
 <body>
   <main class="center">
-    <div hx-get="/now_playing" hx-trigger="load, every 10s" hx-swap="innerHTML">
-      <img src="{{ image_url }}" alt="Cover">
+    <div class="player" role="application" aria-label="YouTube radio player">
+      <img id="cover" class="cover" src="{{ image_url }}" alt="Cover">
+
+      <div id="meta" style="margin-bottom:6px;">
+        <h1 id="title">Nothing</h1>
+        <div id="artist" class="artist">Unknown</div>
+      </div>
+
+      <!-- visualizer -->
+      <div class="viz-wrap" aria-hidden="false">
+        <canvas id="visualizer" width="900" height="84" aria-hidden="true"></canvas>
+
+        <!-- listened time (top-left) -->
+        <div class="viz-overlay viz-top-left" id="viz-left">
+          Listened: <strong style="margin-left:6px"><span id="time-listened">0:00</span></strong>
+        </div>
+
+        <!-- volume overlay (top-right) -->
+        <div class="viz-overlay viz-top-right" id="viz-right" aria-label="volume control">
+          Vol
+          <input id="vol-slider" type="range" min="0" max="100" value="100" aria-label="volume" />
+        </div>
+      </div>
+
+      <!-- hidden audio element -->
+      <audio id="radio-audio" crossorigin="anonymous" preload="none"></audio>
+
+      <!-- Controls: latency and resync displayed inline on wide screens, stacked on narrow screens -->
+      <div class="controls-row" aria-label="player controls">
+        <div class="control-group">
+          <button id="resync-btn" class="btn" title="Attempt to resync to live">Resync</button>
+          <div class="latency-display" id="latency-display" aria-live="polite">Latency: —</div>
+        </div>
+
+        <div id="status-space" class="status-space" aria-live="polite"></div>
+      </div>
     </div>
-    <small><code>/stream /playlist.m3u</code></small>
   </main>
+
+  <!-- footer fixed at page bottom with routes -->
+  <footer class="fixed-footer" role="contentinfo" aria-label="routes footer">
+    <div class="route-code"><code>/stream</code></div>
+    <div class="route-code"><code>/playlist.m3u</code></div>
+  </footer>
+
+  <script>
+  (function(){
+    const audio = document.getElementById('radio-audio');
+    const canvas = document.getElementById('visualizer');
+    const ctx = canvas.getContext('2d');
+    const cover = document.getElementById('cover');
+    const titleEl = document.getElementById('title');
+    const artistEl = document.getElementById('artist');
+    const timeListenedEl = document.getElementById('time-listened');
+    const resyncBtn = document.getElementById('resync-btn');
+    const volSlider = document.getElementById('vol-slider');
+    const statusSpace = document.getElementById('status-space');
+    const latencyEl = document.getElementById('latency-display');
+
+    // set stream
+    statusSpace.textContent = '';
+    audio.src = '/stream';
+    audio.autoplay = true;
+
+    // persisted volume
+    const VOLUME_KEY = 'yt_radio_volume';
+    function loadVolume() {
+      try {
+        const saved = localStorage.getItem(VOLUME_KEY);
+        const v = (saved !== null) ? Number(saved) : 100;
+        const vol = Math.min(100, Math.max(0, Number(v)));
+        volSlider.value = String(vol);
+        audio.volume = vol / 100;
+        audio.muted = (vol === 0);
+      } catch (e) {
+        volSlider.value = '100';
+        audio.volume = 1;
+        audio.muted = false;
+      }
+    }
+    function saveVolume(n) {
+      try { localStorage.setItem(VOLUME_KEY, String(n)); } catch(e) {}
+    }
+    loadVolume();
+
+    // listened timer
+    let listenedSeconds = 0;
+    let lastPlayTimestamp = null;
+    function formatTime(s) {
+      const m = Math.floor(s/60);
+      const sec = Math.floor(s%60).toString().padStart(2,'0');
+      return `${m}:${sec}`;
+    }
+    audio.addEventListener('play', () => { lastPlayTimestamp = Date.now(); });
+    audio.addEventListener('pause', () => {
+      if (lastPlayTimestamp) {
+        listenedSeconds += (Date.now() - lastPlayTimestamp)/1000;
+        lastPlayTimestamp = null;
+        timeListenedEl.textContent = formatTime(listenedSeconds);
+      }
+    });
+    audio.addEventListener('ended', () => {
+      if (lastPlayTimestamp) {
+        listenedSeconds += (Date.now() - lastPlayTimestamp)/1000;
+        lastPlayTimestamp = null;
+        timeListenedEl.textContent = formatTime(listenedSeconds);
+      }
+    });
+    setInterval(() => {
+      if (lastPlayTimestamp) {
+        const extra = (Date.now() - lastPlayTimestamp)/1000;
+        timeListenedEl.textContent = formatTime(listenedSeconds + extra);
+      }
+    }, 1000);
+
+    // volume handler
+    volSlider.addEventListener('input', (e) => {
+      const v = Math.round(Number(e.target.value));
+      audio.volume = v / 100;
+      audio.muted = (v === 0);
+      saveVolume(v);
+    });
+
+    // resync logic
+    const TARGET_DELAY = 1.5;
+    resyncBtn.addEventListener('click', () => {
+      try {
+        const buf = audio.buffered;
+        if (buf && buf.length) {
+          const end = buf.end(buf.length - 1);
+          const target = Math.max(0, end - TARGET_DELAY);
+          try {
+            audio.currentTime = target;
+            audio.play().catch(()=>{});
+            setTimeout(()=>statusSpace.textContent='', 2000);
+            return;
+          } catch(e){}
+        }
+      } catch(e){}
+      audio.src = '/stream?rs=' + Date.now();
+      audio.load();
+      audio.play().catch(()=>{});
+      setTimeout(()=>statusSpace.textContent='', 2000);
+    });
+
+    // latency: always display ms
+    function formatLatencyMs(s) {
+      if (s === null || s === undefined || Number.isNaN(s)) return '—';
+      return `${Math.round(s * 1000)}ms`;
+    }
+    function updateLatency(){
+      let lat = null;
+      try {
+        const buf = audio.buffered;
+        if (buf && buf.length) {
+          const end = buf.end(buf.length - 1);
+          lat = Math.max(0, end - audio.currentTime);
+        } else if (audio.seekable && audio.seekable.length) {
+          const end = audio.seekable.end(audio.seekable.length - 1);
+          lat = Math.max(0, end - audio.currentTime);
+        }
+      } catch(e){}
+      latencyEl.textContent = 'Latency: ' + formatLatencyMs(lat);
+    }
+    setInterval(updateLatency, 500);
+    updateLatency();
+
+    // now-playing poll
+    async function updateNowPlaying(){
+      try {
+        const res = await fetch('/now_playing', { headers: { 'Accept': 'application/json' } });
+        if (!res.ok) return;
+        const json = await res.json();
+        titleEl.textContent = json.title || 'Nothing';
+        artistEl.textContent = json.artist || 'Unknown';
+        if (json.id) cover.src = `https://img.youtube.com/vi/${json.id}/maxresdefault.jpg`;
+      } catch(e){}
+    }
+    updateNowPlaying();
+    setInterval(updateNowPlaying, 8000);
+
+    // resume audio context on gesture
+    document.addEventListener('click', function once(){
+      try { if (window.AudioContext && window.AudioContext.prototype.resume) window.AudioContext.prototype.resume(); } catch(_) {}
+      document.removeEventListener('click', once);
+    });
+
+    // visualizer - purple palette
+    (function(){
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) { canvas.style.display='none'; return; }
+      const actx = new AudioCtx();
+      let src;
+      try { src = actx.createMediaElementSource(audio); }
+      catch(e) { canvas.style.display='none'; return; }
+      const analyser = actx.createAnalyser(); analyser.fftSize = 2048;
+      src.connect(analyser); analyser.connect(actx.destination);
+      const bufferLen = analyser.frequencyBinCount;
+      const data = new Uint8Array(bufferLen);
+
+      // handle high-DPI canvas scaling
+      function resizeCanvas() {
+        const ratio = window.devicePixelRatio || 1;
+        const w = canvas.clientWidth;
+        const h = canvas.clientHeight;
+        canvas.width = Math.floor(w * ratio);
+        canvas.height = Math.floor(h * ratio);
+        ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+      }
+      resizeCanvas();
+      window.addEventListener('resize', resizeCanvas);
+
+      function draw(){
+        requestAnimationFrame(draw);
+        analyser.getByteFrequencyData(data);
+        ctx.clearRect(0,0,canvas.width,canvas.height);
+        const bars = 64;
+        const step = Math.max(1, Math.floor(bufferLen / bars));
+        const barWidth = canvas.width / (bars * (window.devicePixelRatio || 1));
+        let x = 0;
+        for (let i = 0; i < bufferLen; i += step) {
+          const v = data[i];
+          const h = (v / 255) * canvas.clientHeight;
+          ctx.fillStyle = `hsl(270,78%,${28 + (v/255) * 52}%)`;
+          ctx.fillRect(x, canvas.clientHeight - h, barWidth * 0.9, h);
+          x += barWidth;
+        }
+      }
+      draw();
+    })();
+
+  })();
+  </script>
 </body>
 </html>
