@@ -396,9 +396,16 @@
     updateNowPlaying();
     setInterval(updateNowPlaying, 8000);
 
-    // resume audio context on gesture
+
     document.addEventListener('click', function once(){
-      try { if (window.AudioContext && window.AudioContext.prototype.resume) window.AudioContext.prototype.resume(); } catch(_) {}
+      try {
+        const actx = window.__ytRadioAudioContext;
+        if (actx && typeof actx.resume === 'function') {
+          actx.resume().catch(()=>{});
+        } else {
+          audio.play().catch(()=>{});
+        }
+      } catch(_) {}
       document.removeEventListener('click', once);
     });
 
@@ -407,6 +414,8 @@
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
       if (!AudioCtx) { canvas.style.display='none'; return; }
       const actx = new AudioCtx();
+      // expose the AudioContext instance so the gesture handler can resume it
+      try { window.__ytRadioAudioContext = actx; } catch(e) {}
       let src;
       try { src = actx.createMediaElementSource(audio); }
       catch(e) { canvas.style.display='none'; return; }
