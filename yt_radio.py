@@ -56,7 +56,34 @@ def _save_cache():
             logger.exception("Failed to save cache to %s", CACHE_FILE)
 
 
+def load_urls_from_file(path: str):
+    urls = []
+    if not path:
+        logger.debug("No path provided to load_urls_from_file")
+        return urls
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line:
+                    continue
+                if line.startswith("#"):
+                    continue
+                if " #" in line:
+                    line = line.split(" #", 1)[0].strip()
+                urls.append(line)
+        logger.info("Loaded %d URLs from %s", len(urls), path)
+    except FileNotFoundError:
+        logger.warning("URL file not found: %s", path)
+    except Exception:
+        logger.exception("Failed to read URL file: %s", path)
+    return urls
+
+
 def convert_playlist_to_links(link: str):
+    if link.endswith(".radio"):
+        logger.info(".radio file specified, loading from local file")
+        return load_urls_from_file(link)
     ydl_opts = {
         "quiet": True,
         "extract_flat": True,
