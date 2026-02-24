@@ -24,6 +24,7 @@ BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000")
 PLAYLIST_URL = os.environ.get("PLAYLIST_URL")
 CACHE_FILE = os.environ.get("CACHE_FILE", "cache.json")
 RANDOMIZE_PLAYLIST = bool(os.environ.get("RANDOMIZE_PLAYLIST", "false"))
+META_INTERVAL_SECONDS = int(os.environ.get("META_INTERVAL_SECONDS", "5"))
 
 # optional / page
 SITE_TITLE = os.environ.get("SITE_TITLE", "yt_radio.py")
@@ -61,24 +62,52 @@ def convert_playlist_to_links(link: str):
         "extract_flat": True,
     }
     urls = []
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(link, download=False)
-        entries = info.get("entries") if isinstance(info, dict) else None
-        if not entries:
-            logger.warning("No entries found in playlist info for %s", link)
-            return urls
-        for entry in entries:
-            entry_id = None
-            if isinstance(entry, dict):
-                entry_id = entry.get("id") or entry.get("url")
-            elif isinstance(entry, str):
-                entry_id = entry
-            if not entry_id:
-                continue
-            if entry_id.startswith("http"):
-                urls.append(entry_id)
+    logger.info("Starting conversion of playlist to links: %s", link)
+    try:
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(link, download=False)
+    except Exception:
+        logger.exception("yt-dlp failed to extract playlist info for %s", link)
+        return urls
+    entries = info.get("entries") if isinstance(info, dict) else None
+    if isinstance(entries, list):
+        logger.info("Playlist info returned %d entries", len(entries))
+    else:
+        if isinstance(info, dict):
+            vid = info.get("id") or info.get("url") or info.get("webpage_url")
+            if vid:
+                if isinstance(vid, str) and vid.startswith("http"):
+                    urls.append(vid)
+                    logger.info("Single video found for playlist URL, added: %s", vid)
+                else:
+                    constructed = f"https://www.youtube.com/watch?v={vid}"
+                    urls.append(constructed)
+                    logger.info("Single video id found for playlist URL, constructed: %s", constructed)
             else:
-                urls.append(f"https://www.youtube.com/watch?v={entry_id}")
+                logger.warning("No entries found in playlist info for %s", link)
+        else:
+            logger.warning("Unexpected playlist info format for %s: %r", link, type(info))
+        return urls
+    for idx, entry in enumerate(entries, start=1):
+        entry_id = None
+        if isinstance(entry, dict):
+            entry_id = entry.get("id") or entry.get("url")
+        elif isinstance(entry, str):
+            entry_id = entry
+
+        if not entry_id:
+            logger.debug("Skipping playlist entry #%d: no id/url present", idx)
+            continue
+
+        if isinstance(entry_id, str) and entry_id.startswith("http"):
+            urls.append(entry_id)
+            logger.debug("Playlist entry #%d: added direct URL %s", idx, entry_id)
+        else:
+            constructed = f"https://www.youtube.com/watch?v={entry_id}"
+            urls.append(constructed)
+            logger.debug("Playlist entry #%d: constructed URL %s from id %s", idx, constructed, entry_id)
+
+    logger.info("Finished converting playlist: %d links generated", len(urls))
     return urls
 
 
@@ -329,7 +358,19 @@ def playlist_route():
 def stream():
     ensure_radio_running()
     sid, q = add_subscriber()
+
+    bytes_per_sec = (BITRATE_KBPS * 1000) // 8
+    metaint = bytes_per_sec * META_INTERVAL_SECONDS
+    def make_metadata_block(artist: str, title: str) -> bytes:
+        meta_str = f"StreamTitle='{artist} - {title}';"
+        meta_iso = meta_str.encode("iso-8859-1", errors="replace")
+        blocks = (len(meta_iso) + 15) // 16
+        if blocks == 0:
+            return b"\x00"
+        padding = blocks * 16 - len(meta_iso)
+        return bytes([blocks]) + meta_iso + (b"\x00" * padding)
     def generate():
+        bytes_since_meta = 0
         try:
             while True:
                 try:
@@ -339,13 +380,38 @@ def stream():
                         logger.warning("Producer stopped; restarting")
                         ensure_radio_running()
                     continue
-                yield chunk
+                pos = 0
+                chunk_len = len(chunk)
+                if metaint <= 0:
+                    yield chunk
+                    continue
+
+                while pos < chunk_len:
+                    remaining = metaint - bytes_since_meta
+                    take = min(remaining, chunk_len - pos)
+                    if take > 0:
+                        yield chunk[pos:pos + take]
+                        pos += take
+                        bytes_since_meta += take
+
+                    if bytes_since_meta >= metaint:
+                        title = (NOW_PLAYING.get("title") or "").strip()
+                        artist = (NOW_PLAYING.get("artist") or "").strip()
+
+                        meta_block = make_metadata_block(artist, title)
+                        yield meta_block
+                        bytes_since_meta = 0
         except GeneratorExit:
             logger.info("Client disconnected (sid=%s)", sid)
         finally:
             remove_subscriber(sid)
+    headers = {
+        "icy-br": str(BITRATE_KBPS),
+        "icy-metaint": str(metaint),
+        "icy-name": SITE_TITLE or "yt_radio.py",
+    }
+    return Response(stream_with_context(generate()), mimetype="audio/mpeg", headers=headers)
 
-    return Response(stream_with_context(generate()), mimetype="audio/mpeg")
 
 
 @app.route("/now_playing")
