@@ -158,6 +158,8 @@ def fetch_metadata(index, url):
             ["yt-dlp", "--dump-json", url],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=30,
         )
         if result.returncode != 0 or not result.stdout:
@@ -390,12 +392,12 @@ def stream():
     metaint = bytes_per_sec * META_INTERVAL_SECONDS
     def make_metadata_block(artist: str, title: str) -> bytes:
         meta_str = f"StreamTitle='{artist} - {title}';"
-        meta_iso = meta_str.encode("iso-8859-1", errors="replace")
-        blocks = (len(meta_iso) + 15) // 16
+        meta_utf = meta_str.encode("utf-8", errors="replace")
+        blocks = (len(meta_utf) + 15) // 16
         if blocks == 0:
             return b"\x00"
-        padding = blocks * 16 - len(meta_iso)
-        return bytes([blocks]) + meta_iso + (b"\x00" * padding)
+        padding = blocks * 16 - len(meta_utf)
+        return bytes([blocks]) + meta_utf + (b"\x00" * padding)
     def generate():
         bytes_since_meta = 0
         try:
@@ -436,6 +438,8 @@ def stream():
         "icy-br": str(BITRATE_KBPS),
         "icy-metaint": str(metaint),
         "icy-name": SITE_TITLE or "yt_radio.py",
+        "icy-charset": "utf-8"
+
     }
     return Response(stream_with_context(generate()), mimetype="audio/mpeg", headers=headers)
 
