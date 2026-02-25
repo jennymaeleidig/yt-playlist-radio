@@ -1,5 +1,6 @@
 from flask import Flask, Response, stream_with_context, jsonify, render_template, request
 from yt_dlp import YoutubeDL
+from file_util import _load_urls_from_file, _create_or_get_cache, _save_cache
 import subprocess
 import json
 import threading
@@ -36,54 +37,20 @@ METADATA = {}
 NOW_PLAYING = {"index": None, "title": "Nothing", "artist": "Unknown", "id": ""}
 
 _CACHE_LOCK = threading.Lock()
-try:
-    if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r", encoding="utf-8") as f:
-            _CACHE = json.load(f)
-    else:
-        _CACHE = {}
-except Exception:
-    logger.exception("Failed to load cache file, starting with empty cache")
-    _CACHE = {}
+_CACHE = _create_or_get_cache(CACHE_FILE)
 
+SUBSCRIBERS = {}  # sid -> Queue[bytes]
+SUBSCRIBERS_LOCK = threading.Lock()
+RADIO_THREAD = None
+RADIO_STOP = threading.Event()
 
-def _save_cache():
-    with _CACHE_LOCK:
-        try:
-            with open(CACHE_FILE, "w", encoding="utf-8") as f:
-                json.dump(_CACHE, f, ensure_ascii=False, indent=2)
-        except Exception:
-            logger.exception("Failed to save cache to %s", CACHE_FILE)
-
-
-def load_urls_from_file(path: str):
-    urls = []
-    if not path:
-        logger.debug("No path provided to load_urls_from_file")
-        return urls
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for raw in f:
-                line = raw.strip()
-                if not line:
-                    continue
-                if line.startswith("#"):
-                    continue
-                if " #" in line:
-                    line = line.split(" #", 1)[0].strip()
-                urls.append(line)
-        logger.info("Loaded %d URLs from %s", len(urls), path)
-    except FileNotFoundError:
-        logger.warning("URL file not found: %s", path)
-    except Exception:
-        logger.exception("Failed to read URL file: %s", path)
-    return urls
-
+CHUNK_SIZE = 8192
+QUEUE_MAX_CHUNKS = 256
 
 def convert_playlist_to_links(link: str):
     if link.endswith(".radio"):
         logger.info(".radio file specified, loading from local file")
-        return load_urls_from_file(link)
+        return _load_urls_from_file(link)
     ydl_opts = {
         "quiet": True,
         "extract_flat": True,
@@ -178,7 +145,7 @@ def fetch_metadata(index, url):
                 "duration": data.get("duration"),
                 "id": data.get("id")
             }
-        _save_cache()
+        _save_cache(_CACHE, CACHE_FILE)
     except Exception:
         METADATA[index] = {
             "title": f"Track {index+1}",
@@ -271,13 +238,6 @@ def _stream_track(index):
         logger.info("Finished sending [%d/%d]: %s - %s", index + 1, len(PLAYLIST), meta["artist"], meta["title"])
 
 
-SUBSCRIBERS = {}  # sid -> Queue[bytes]
-SUBSCRIBERS_LOCK = threading.Lock()
-RADIO_THREAD = None
-RADIO_STOP = threading.Event()
-
-CHUNK_SIZE = 8192
-QUEUE_MAX_CHUNKS = 256
 
 
 def add_subscriber():
