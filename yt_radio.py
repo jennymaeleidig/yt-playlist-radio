@@ -11,6 +11,7 @@ import logging
 import time
 from queue import Queue, Empty
 import uuid
+import tempfile
 
 load_dotenv()
 
@@ -88,7 +89,6 @@ def convert_playlist_to_links(link: str):
             entry_id = entry.get("id") or entry.get("url")
         elif isinstance(entry, str):
             entry_id = entry
-
         if not entry_id:
             logger.debug("Skipping playlist entry #%d: no id/url present", idx)
             continue
@@ -174,7 +174,8 @@ def _ensure_metadata(index):
 def _stream_track(index):
     url = PLAYLIST[index]
     _ensure_metadata(index)
-    meta = METADATA.get(index, {"title": f"Track {index+1}", "artist": "Unknown", "duration": -1, "id": ""})
+    # make a shallow local copy so metadata can't be mutated by other threads while streaming
+    meta = dict(METADATA.get(index, {"title": f"Track {index+1}", "artist": "Unknown", "duration": -1, "id": ""}))
 
     NOW_PLAYING["index"] = index
     NOW_PLAYING["title"] = meta.get("title", "")
@@ -182,10 +183,14 @@ def _stream_track(index):
     NOW_PLAYING["id"] = meta.get("id", "")
     logger.info("Now playing [%d/%d]: %s - %s", index + 1, len(PLAYLIST), meta.get("artist", ""), meta.get("title", ""))
 
+    # capture subprocess stderr to temp files so we can log diagnostics on failures
+    ytdlp_err = tempfile.TemporaryFile()
+    ffmpeg_err = tempfile.TemporaryFile()
+
     ytdlp = subprocess.Popen(
         ["yt-dlp", "-f", "bestaudio", "-o", "-", url],
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=ytdlp_err,
     )
 
     ffmpeg = subprocess.Popen(
@@ -202,7 +207,7 @@ def _stream_track(index):
         ],
         stdin=ytdlp.stdout,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=ffmpeg_err,
     )
     ytdlp.stdout.close()
 
@@ -235,7 +240,28 @@ def _stream_track(index):
             pass
         ffmpeg.wait()
         ytdlp.wait()
-        logger.info("Finished sending [%d/%d]: %s - %s", index + 1, len(PLAYLIST), meta["artist"], meta["title"])
+        elapsed = time.monotonic() - start_time
+        logger.info("Finished sending [%d/%d]: %r - %r (bytes_sent=%d, elapsed=%.2fs)", index + 1, len(PLAYLIST), meta.get("artist"), meta.get("title"), bytes_sent, elapsed)
+        try:
+            ffmpeg_err.seek(0)
+            ferr = ffmpeg_err.read().decode("utf-8", errors="replace")
+            if ferr:
+                logger.warning("ffmpeg stderr for track %d: %s", index + 1, ferr.strip())
+            ytdlp_err.seek(0)
+            yerr = ytdlp_err.read().decode("utf-8", errors="replace")
+            if yerr:
+                logger.warning("yt-dlp stderr for track %d: %s", index + 1, yerr.strip())
+        except Exception:
+            logger.exception("Failed to read subprocess stderr")
+        finally:
+            try:
+                ffmpeg_err.close()
+            except Exception:
+                pass
+            try:
+                ytdlp_err.close()
+            except Exception:
+                pass
 
 
 
