@@ -15,3 +15,10 @@ uv run gunicorn yt_radio:app --bind 0.0.0.0:8000 -k gthread --threads 50 --worke
 
 ## Example Landing Page
 <img width="936" height="992" alt="image" src="https://github.com/user-attachments/assets/e70879ad-bdff-46b0-8018-130211d950a1" />
+
+## Local Playlist
+In case when fetching from YouTube takes too long for some reason, you can also specify a local `.radio` file. An example file has been included in this repo.
+
+The radio code will parse links from this file as the playlist instead. Set `PLAYLIST_URL="PATH_TO_.RADIO_FILE"`
+
+The file must end with `.radio`

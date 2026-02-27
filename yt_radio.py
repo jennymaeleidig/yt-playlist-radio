@@ -44,6 +44,7 @@ SUBSCRIBERS = {}  # sid -> Queue[bytes]
 SUBSCRIBERS_LOCK = threading.Lock()
 RADIO_THREAD = None
 RADIO_STOP = threading.Event()
+SUBSCRIBER_EVENT = threading.Event()
 
 CHUNK_SIZE = 8192
 QUEUE_MAX_CHUNKS = 256
@@ -271,6 +272,7 @@ def add_subscriber():
     sid = uuid.uuid4().hex
     with SUBSCRIBERS_LOCK:
         SUBSCRIBERS[sid] = q
+        SUBSCRIBER_EVENT.set()
     logger.info("Subscriber added sid=%s (total=%d)", sid, len(SUBSCRIBERS))
     return sid, q
 
@@ -280,6 +282,8 @@ def remove_subscriber(sid):
         if sid in SUBSCRIBERS:
             SUBSCRIBERS.pop(sid, None)
             logger.info("Subscriber removed sid=%s (total=%d)", sid, len(SUBSCRIBERS))
+        if not SUBSCRIBERS:
+            SUBSCRIBER_EVENT.clear()
 
 
 def broadcast_chunk(chunk: bytes):
@@ -300,6 +304,9 @@ def broadcast_chunk(chunk: bytes):
 def _radio_loop():
     played = []
     while not RADIO_STOP.is_set():
+        if not SUBSCRIBER_EVENT.wait(timeout=1):
+            continue
+
         if not PLAYLIST:
             logger.error("Playlist is empty, cannot stream")
             time.sleep(1)
@@ -316,6 +323,10 @@ def _radio_loop():
             for chunk in _stream_track(index):
                 if RADIO_STOP.is_set():
                     break
+                with SUBSCRIBERS_LOCK:
+                    if not SUBSCRIBERS:
+                        logger.info("No subscribers remaining; stopping track early")
+                        break
                 broadcast_chunk(chunk)
         except Exception:
             logger.exception("Error in radio producer, skipping track")
