@@ -1,4 +1,3 @@
-from flask import Flask, Response, stream_with_context, jsonify, render_template, request
 from yt_dlp import YoutubeDL
 from file_util import _load_urls_from_file, _create_or_get_cache, _save_cache
 import subprocess
@@ -9,16 +8,16 @@ import os
 from dotenv import load_dotenv
 import logging
 import time
-from queue import Queue, Empty
+from queue import Queue
 import uuid
 import tempfile
+
 
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
 
 BITRATE_KBPS = int(os.environ.get("BITRATE_KBPS", "192"))
 BURST_SECONDS = int(os.environ.get("BURST_SECONDS", "10")) # allow pre-buffering of 10 sec on /stream
@@ -50,9 +49,12 @@ CHUNK_SIZE = 8192
 QUEUE_MAX_CHUNKS = 256
 
 def convert_playlist_to_links(link: str):
+    # Loading a .radio file
     if link.endswith(".radio"):
         logger.info(".radio file specified, loading from local file")
         return _load_urls_from_file(link)
+
+    # Pull YouTube list of URLs from YouTube Playlist
     ydl_opts = {
         "quiet": True,
         "extract_flat": True,
@@ -64,26 +66,15 @@ def convert_playlist_to_links(link: str):
             info = ydl.extract_info(link, download=False)
     except Exception:
         logger.exception("yt-dlp failed to extract playlist info for %s", link)
-        return urls
+        exit(1)
+
     entries = info.get("entries") if isinstance(info, dict) else None
     if isinstance(entries, list):
         logger.info("Playlist info returned %d entries", len(entries))
     else:
-        if isinstance(info, dict):
-            vid = info.get("id") or info.get("url") or info.get("webpage_url")
-            if vid:
-                if isinstance(vid, str) and vid.startswith("http"):
-                    urls.append(vid)
-                    logger.info("Single video found for playlist URL, added: %s", vid)
-                else:
-                    constructed = f"https://www.youtube.com/watch?v={vid}"
-                    urls.append(constructed)
-                    logger.info("Single video id found for playlist URL, constructed: %s", constructed)
-            else:
-                logger.warning("No entries found in playlist info for %s", link)
-        else:
-            logger.warning("Unexpected playlist info format for %s: %r", link, type(info))
-        return urls
+        logger.error("Could not find list of links. Are you providing a YouTube Playlist URL?")
+        exit(1)
+
     for idx, entry in enumerate(entries, start=1):
         entry_id = None
         if isinstance(entry, dict):
@@ -121,6 +112,7 @@ def fetch_metadata(index, url):
         except Exception:
             logger.exception("Failed to use cached metadata for %s, will refetch", url)
 
+    # Get metadata via yt-dlp
     try:
         result = subprocess.run(
             ["yt-dlp", "--dump-json", url],
@@ -131,6 +123,7 @@ def fetch_metadata(index, url):
             timeout=30,
         )
         if result.returncode != 0 or not result.stdout:
+            logger.error("Failed to get metadata from yt-dlp, you may or may not be throttled!")
             raise RuntimeError(f"yt-dlp failed for {url}: {result.stderr.strip()}")
         data = json.loads(result.stdout)
         METADATA[index] = {
@@ -139,7 +132,7 @@ def fetch_metadata(index, url):
             "duration": data.get("duration", -1),
             "id": data.get("id", ""),
         }
-        with _CACHE_LOCK:
+        with _CACHE_LOCK: # get lock
             _CACHE[url] = {
                 "title": data.get("title"),
                 "uploader": data.get("uploader"),
@@ -148,6 +141,7 @@ def fetch_metadata(index, url):
             }
         _save_cache(_CACHE, CACHE_FILE)
     except Exception:
+        # Even if we fail to get meta we may be able to stream music still? So don't exit
         METADATA[index] = {
             "title": f"Track {index+1}",
             "artist": "Unknown",
@@ -157,6 +151,7 @@ def fetch_metadata(index, url):
         logger.debug("Failed to fetch metadata for index %s, using fallback", index)
 
 
+# Bootstrap
 PLAYLIST = convert_playlist_to_links(PLAYLIST_URL)
 PRELOAD_COUNT = min(4, len(PLAYLIST))
 _preload_indices = random.sample(range(len(PLAYLIST)), PRELOAD_COUNT) if PLAYLIST else []
@@ -175,12 +170,8 @@ def _ensure_metadata(index):
 def _stream_track(index):
     url = PLAYLIST[index]
     _ensure_metadata(index)
-    # make a shallow local copy so metadata can't be mutated by other threads while streaming
     meta = dict(METADATA.get(index, {"title": f"Track {index+1}", "artist": "Unknown", "duration": -1, "id": ""}))
-
     logger.info("Now playing [%d/%d]: %s - %s", index + 1, len(PLAYLIST), meta.get("artist", ""), meta.get("title", ""))
-
-    # capture subprocess stderr to temp files so we can log diagnostics on failures
     ytdlp_err = tempfile.TemporaryFile()
     ffmpeg_err = tempfile.TemporaryFile()
 
@@ -217,7 +208,7 @@ def _stream_track(index):
     try:
         while True:
             if ffmpeg.stdout is None:
-                logger.warn("No stdout available from FFMPEG")
+                logger.warning("No stdout available from FFMPEG")
                 break
             chunk = ffmpeg.stdout.read(8192)
             if not chunk:
@@ -304,7 +295,6 @@ def _radio_loop():
     while not RADIO_STOP.is_set():
         if not SUBSCRIBER_EVENT.wait(timeout=1):
             continue
-
         if not PLAYLIST:
             logger.error("Playlist is empty, cannot stream")
             time.sleep(1)
@@ -316,7 +306,6 @@ def _radio_loop():
 
         index = random.choice(available)
         played.append(index)
-
         try:
             for chunk in _stream_track(index):
                 if RADIO_STOP.is_set():
@@ -341,149 +330,8 @@ def ensure_radio_running():
     RADIO_THREAD.start()
     logger.info("Radio producer started; listeners will share the same track")
 
-
 ensure_radio_running()
 
-@app.route("/")
-def home():
-    return render_template("index.html", title=SITE_TITLE, image_url=SITE_IMAGE)
-
-
-@app.route("/playlist.m3u")
-def playlist_route():
-    if not PLAYLIST:
-        return Response("#EXTM3U\n", mimetype="audio/x-mpegurl")
-    indices = list(range(len(PLAYLIST)))
-    if RANDOMIZE_PLAYLIST:
-        random.shuffle(indices)
-
-    lines = ["#EXTM3U"]
-    for i in indices:
-        try:
-            _ensure_metadata(i)
-        except Exception:
-            logger.debug("Failed to ensure metadata for index %s", i)
-
-        meta = METADATA.get(i, {})
-        title = meta.get("title", f"Track {i+1}")
-        artist = meta.get("artist", "Unknown")
-        duration = meta.get("duration", -1)
-        try:
-            duration_int = int(duration) if isinstance(duration, (int, float, str)) and str(duration).isdigit() else int(duration) if isinstance(duration, int) else -1
-        except Exception:
-            duration_int = -1
-        lines.append(f"#EXTINF:{duration_int},{artist} - {title}")
-        lines.append(PLAYLIST[i])
-    body = "\n".join(lines) + "\n"
-    return Response(body, mimetype="audio/x-mpegurl")
-
-
-@app.route("/stream")
-def stream():
-    ensure_radio_running()
-    sid, q = add_subscriber()
-
-    bytes_per_sec = (BITRATE_KBPS * 1000) // 8
-    metaint = bytes_per_sec * META_INTERVAL_SECONDS
-    def make_metadata_block(artist: str, title: str) -> bytes:
-        meta_str = f"StreamTitle='{artist} - {title}';"
-        meta_utf = meta_str.encode("utf-8", errors="replace")
-        blocks = (len(meta_utf) + 15) // 16
-        if blocks == 0:
-            return b"\x00"
-        padding = blocks * 16 - len(meta_utf)
-        return bytes([blocks]) + meta_utf + (b"\x00" * padding)
-    def generate():
-        bytes_since_meta = 0
-        current_index = None
-        try:
-            while True:
-                try:
-                    item = q.get(timeout=5)
-                except Empty:
-                    if RADIO_THREAD and not RADIO_THREAD.is_alive():
-                        logger.warning("Producer stopped; restarting")
-                        ensure_radio_running()
-                    continue
-
-                if isinstance(item, tuple) and len(item) == 2:
-                    chunk_index, chunk = item
-                else:
-                    chunk_index, chunk = None, item
-
-                if chunk_index is not None and chunk_index != current_index:
-                    meta = METADATA.get(chunk_index, {"title": f"Track {chunk_index+1}", "artist": "Unknown", "duration": -1, "id": ""})
-                    NOW_PLAYING["index"] = chunk_index
-                    NOW_PLAYING["title"] = meta.get("title", "")
-                    NOW_PLAYING["artist"] = meta.get("artist", "")
-                    NOW_PLAYING["id"] = meta.get("id", "")
-                    current_index = chunk_index
-
-                pos = 0
-                chunk_len = len(chunk)
-                if metaint <= 0:
-                    yield chunk
-                    continue
-
-                while pos < chunk_len:
-                    remaining = metaint - bytes_since_meta
-                    take = min(remaining, chunk_len - pos)
-                    if take > 0:
-                        yield chunk[pos:pos + take]
-                        pos += take
-                        bytes_since_meta += take
-
-                    if bytes_since_meta >= metaint:
-                        title = (NOW_PLAYING.get("title") or "").strip()
-                        artist = (NOW_PLAYING.get("artist") or "").strip()
-
-                        meta_block = make_metadata_block(artist, title)
-                        yield meta_block
-                        bytes_since_meta = 0
-        except GeneratorExit:
-            logger.info("Client disconnected (sid=%s)", sid)
-        finally:
-            remove_subscriber(sid)
-    headers = {
-        "icy-br": str(BITRATE_KBPS),
-        "icy-metaint": str(metaint),
-        "icy-name": SITE_TITLE or "yt_radio.py",
-        "icy-charset": "utf-8"
-
-    }
-    return Response(stream_with_context(generate()), mimetype="audio/mpeg", headers=headers)
-
-
-
-@app.route("/now_playing")
-def now_playing():
-    hx = request.headers.get("HX-Request")
-    accept = request.headers.get("Accept", "")
-    if (hx and hx.lower() == "true") or ("text/html" in accept and "application/json" not in accept):
-        title = NOW_PLAYING.get("title") or "Nothing"
-        artist = NOW_PLAYING.get("artist") or "Unknown"
-        vid = NOW_PLAYING.get("id") or ""
-        thumb_url = f"https://img.youtube.com/vi/{vid}/maxresdefault.jpg" if vid else (SITE_IMAGE or "")
-        return f'<img src="{thumb_url}" alt="Cover" style="width:300px;height:300px;object-fit:cover;display:block;margin:0 auto 12px;"><div>{artist} — {title}</div>'
-    return jsonify(NOW_PLAYING)
-
-
-
-
-@app.route("/tracks")
-def tracks():
-    track_list = []
-    for i, url in enumerate(PLAYLIST):
-        meta = METADATA.get(i, {"title": f"Track {i+1}", "artist": "Unknown", "duration": -1})
-        track_list.append({
-            "index": i,
-            "title": meta["title"],
-            "artist": meta["artist"],
-            "duration": meta["duration"],
-            "url": url,
-        })
-    return jsonify(track_list)
-
-
 if __name__ == "__main__":
+    from routes import app
     app.run(host="0.0.0.0", port=8000, threaded=True)
