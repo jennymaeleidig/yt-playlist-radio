@@ -178,10 +178,6 @@ def _stream_track(index):
     # make a shallow local copy so metadata can't be mutated by other threads while streaming
     meta = dict(METADATA.get(index, {"title": f"Track {index+1}", "artist": "Unknown", "duration": -1, "id": ""}))
 
-    NOW_PLAYING["index"] = index
-    NOW_PLAYING["title"] = meta.get("title", "")
-    NOW_PLAYING["artist"] = meta.get("artist", "")
-    NOW_PLAYING["id"] = meta.get("id", "")
     logger.info("Now playing [%d/%d]: %s - %s", index + 1, len(PLAYLIST), meta.get("artist", ""), meta.get("title", ""))
 
     # capture subprocess stderr to temp files so we can log diagnostics on failures
@@ -210,7 +206,8 @@ def _stream_track(index):
         stdout=subprocess.PIPE,
         stderr=ffmpeg_err,
     )
-    ytdlp.stdout.close()
+    if ytdlp.stdout:
+        ytdlp.stdout.close()
 
     bytes_per_sec = (BITRATE_KBPS * 1000) // 8
     burst_bytes = bytes_per_sec * BURST_SECONDS
@@ -219,6 +216,9 @@ def _stream_track(index):
 
     try:
         while True:
+            if ffmpeg.stdout is None:
+                logger.warn("No stdout available from FFMPEG")
+                break
             chunk = ffmpeg.stdout.read(8192)
             if not chunk:
                 break
@@ -265,8 +265,6 @@ def _stream_track(index):
                 pass
 
 
-
-
 def add_subscriber():
     q = Queue(maxsize=QUEUE_MAX_CHUNKS)
     sid = uuid.uuid4().hex
@@ -286,17 +284,17 @@ def remove_subscriber(sid):
             SUBSCRIBER_EVENT.clear()
 
 
-def broadcast_chunk(chunk: bytes):
+def broadcast_chunk(track_index: int, chunk: bytes):
     with SUBSCRIBERS_LOCK:
         subs = list(SUBSCRIBERS.items())
-    for sid, q in subs: # push the same chunk to all subscribers
+    for _, q in subs: # push the same chunk to all subscribers, we do nothing with sid for now
         if q.full():
             try:
                 q.get_nowait()
             except Exception:
                 pass
         try:
-            q.put_nowait(chunk)
+            q.put_nowait((track_index, chunk))
         except Exception:
             pass
 
@@ -327,7 +325,7 @@ def _radio_loop():
                     if not SUBSCRIBERS:
                         logger.info("No subscribers remaining; stopping track early")
                         break
-                broadcast_chunk(chunk)
+                broadcast_chunk(index, chunk)
         except Exception:
             logger.exception("Error in radio producer, skipping track")
             time.sleep(1)
@@ -397,15 +395,30 @@ def stream():
         return bytes([blocks]) + meta_utf + (b"\x00" * padding)
     def generate():
         bytes_since_meta = 0
+        current_index = None
         try:
             while True:
                 try:
-                    chunk = q.get(timeout=5)
+                    item = q.get(timeout=5)
                 except Empty:
                     if RADIO_THREAD and not RADIO_THREAD.is_alive():
                         logger.warning("Producer stopped; restarting")
                         ensure_radio_running()
                     continue
+
+                if isinstance(item, tuple) and len(item) == 2:
+                    chunk_index, chunk = item
+                else:
+                    chunk_index, chunk = None, item
+
+                if chunk_index is not None and chunk_index != current_index:
+                    meta = METADATA.get(chunk_index, {"title": f"Track {chunk_index+1}", "artist": "Unknown", "duration": -1, "id": ""})
+                    NOW_PLAYING["index"] = chunk_index
+                    NOW_PLAYING["title"] = meta.get("title", "")
+                    NOW_PLAYING["artist"] = meta.get("artist", "")
+                    NOW_PLAYING["id"] = meta.get("id", "")
+                    current_index = chunk_index
+
                 pos = 0
                 chunk_len = len(chunk)
                 if metaint <= 0:
