@@ -27,6 +27,12 @@ CACHE_FILE = os.environ.get("CACHE_FILE", "cache.json")
 RANDOMIZE_PLAYLIST = bool(os.environ.get("RANDOMIZE_PLAYLIST", "false"))
 META_INTERVAL_SECONDS = int(os.environ.get("META_INTERVAL_SECONDS", "5"))
 
+# yt-dlp format selection with fallback chain for resilience against
+# YouTube experiments that make pure audio-only formats unavailable.
+YTDLP_FORMAT = os.environ.get(
+    "YTDLP_FORMAT", "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best"
+),
+
 # optional / page
 SITE_TITLE = os.environ.get("SITE_TITLE", "yt_radio.py")
 SITE_IMAGE = os.environ.get("SITE_IMAGE", "")
@@ -47,6 +53,8 @@ SUBSCRIBER_EVENT = threading.Event()
 
 CHUNK_SIZE = 8192
 QUEUE_MAX_CHUNKS = 256
+PLAYLIST_LOCK = threading.RLock()
+PLAYLIST_REFRESH_INTERVAL_MINUTES = int(os.environ.get("PLAYLIST_REFRESH_INTERVAL_MINUTES", "60"))
 
 def convert_playlist_to_links(link: str):
     # Loading a .radio file
@@ -66,7 +74,7 @@ def convert_playlist_to_links(link: str):
             info = ydl.extract_info(link, download=False)
     except Exception:
         logger.exception("yt-dlp failed to extract playlist info for %s", link)
-        exit(1)
+        raise RuntimeError(f"yt-dlp failed to extract playlist info for {link}") from None
 
     entries = info.get("entries") if isinstance(info, dict) else None
     if isinstance(entries, list):
@@ -92,9 +100,35 @@ def convert_playlist_to_links(link: str):
             constructed = f"https://www.youtube.com/watch?v={entry_id}"
             urls.append(constructed)
             logger.debug("Playlist entry #%d: constructed URL %s from id %s", idx, constructed, entry_id)
-
-    logger.info("Finished converting playlist: %d links generated", len(urls))
     return urls
+
+def refresh_playlist():
+    """Reload the playlist from the configured source and reset metadata.
+    This is safe to call from a background thread; it replaces the
+    playlist and metadata atomically under PLAYLIST_LOCK.
+    """
+    global PLAYLIST, METADATA
+    try:
+        new_playlist = convert_playlist_to_links(PLAYLIST_URL)
+    except Exception:
+        logger.exception("Failed to refresh playlist from %s", PLAYLIST_URL)
+        return
+
+    with PLAYLIST_LOCK:
+        PLAYLIST = new_playlist
+        METADATA = {}
+        logger.info("Playlist refreshed: %d tracks", len(PLAYLIST))
+
+    # Preload metadata for the first few tracks so the UI isn't blank
+    preload_count = min(4, len(PLAYLIST))
+    if preload_count:
+        indices = random.sample(range(len(PLAYLIST)), preload_count)
+        for i in indices:
+            with PLAYLIST_LOCK:
+                if i >= len(PLAYLIST):
+                    continue
+                url = PLAYLIST[i]
+            threading.Thread(target=fetch_metadata, args=(i, url), daemon=True).start()
 
 
 def fetch_metadata(index, url):
@@ -150,34 +184,55 @@ def fetch_metadata(index, url):
         }
         logger.debug("Failed to fetch metadata for index %s, using fallback", index)
 
+def _playlist_refresh_loop():
+    while not RADIO_STOP.is_set():
+        # Wait for the refresh interval, but wake up quickly if the app stops
+        RADIO_STOP.wait(timeout=PLAYLIST_REFRESH_INTERVAL_MINUTES * 60)
+        if RADIO_STOP.is_set():
+            break
+        refresh_playlist()
 
-# Bootstrap
+
+# Bootstrap with initial playlist load
 PLAYLIST = convert_playlist_to_links(PLAYLIST_URL)
 PRELOAD_COUNT = min(4, len(PLAYLIST))
-_preload_indices = random.sample(range(len(PLAYLIST)), PRELOAD_COUNT) if PLAYLIST else []
-for i in _preload_indices:
-    threading.Thread(target=fetch_metadata, args=(i, PLAYLIST[i]), daemon=True).start()
+if PRELOAD_COUNT:
+    _preload_indices = random.sample(range(len(PLAYLIST)), PRELOAD_COUNT)
+    for i in _preload_indices:
+        threading.Thread(target=fetch_metadata, args=(i, PLAYLIST[i]), daemon=True).start()
 logger.info("Playlist loaded: %d tracks (preloading %d)", len(PLAYLIST), PRELOAD_COUNT)
 logger.info("Stream available at %s/stream", BASE_URL)
 logger.info("M3U available at %s/playlist.m3u", BASE_URL)
 
 
+
 def _ensure_metadata(index):
-    if index not in METADATA:
-        fetch_metadata(index, PLAYLIST[index])
+    if index in METADATA:
+        return
+    with PLAYLIST_LOCK:
+        if index >= len(PLAYLIST):
+            return
+        url = PLAYLIST[index]
+    fetch_metadata(index, url)
 
 
-def _stream_track(index):
-    url = PLAYLIST[index]
+
+def _stream_track(index, url=None):
+    if url is None:
+        with PLAYLIST_LOCK:
+            if index >= len(PLAYLIST):
+                logger.warning("Track index %d is out of range after playlist refresh", index)
+                return
+            url = PLAYLIST[index]
     _ensure_metadata(index)
     meta = dict(METADATA.get(index, {"title": f"Track {index+1}", "artist": "Unknown", "duration": -1, "id": ""}))
     logger.info("Now playing [%d/%d]: %s - %s", index + 1, len(PLAYLIST), meta.get("artist", ""), meta.get("title", ""))
+
     ytdlp_err = tempfile.TemporaryFile()
     ffmpeg_err = tempfile.TemporaryFile()
 
     ytdlp = subprocess.Popen(
-        ["yt-dlp", "-f", "bestaudio", "-o", "-", url],
-        stdout=subprocess.PIPE,
+        ["yt-dlp", "-f", YTDLP_FORMAT, "-o", "-", url],
         stderr=ytdlp_err,
     )
 
@@ -295,19 +350,22 @@ def _radio_loop():
     while not RADIO_STOP.is_set():
         if not SUBSCRIBER_EVENT.wait(timeout=1):
             continue
-        if not PLAYLIST:
+        with PLAYLIST_LOCK:
+            playlist_snapshot = list(PLAYLIST)
+        if not playlist_snapshot:
             logger.error("Playlist is empty, cannot stream")
             time.sleep(1)
             continue
-        available = [i for i in range(len(PLAYLIST)) if i not in played]
+        available = [i for i in range(len(playlist_snapshot)) if i not in played]
         if not available:
             played.clear()
-            available = list(range(len(PLAYLIST)))
+            available = list(range(len(playlist_snapshot)))
 
         index = random.choice(available)
         played.append(index)
+        url = playlist_snapshot[index]
         try:
-            for chunk in _stream_track(index):
+            for chunk in _stream_track(index, url):
                 if RADIO_STOP.is_set():
                     break
                 with SUBSCRIBERS_LOCK:
@@ -329,6 +387,17 @@ def ensure_radio_running():
     RADIO_THREAD = threading.Thread(target=_radio_loop, daemon=True)
     RADIO_THREAD.start()
     logger.info("Radio producer started; listeners will share the same track")
+    ensure_playlist_refresh_running()
+
+def ensure_playlist_refresh_running():
+    for t in threading.enumerate():
+        if getattr(t, "_yt_radio_refresh", False):
+            return
+    refresh_thread = threading.Thread(target=_playlist_refresh_loop, daemon=True)
+    refresh_thread._yt_radio_refresh = True
+    refresh_thread.start()
+    logger.info("Playlist refresh thread started (interval=%d minutes)", PLAYLIST_REFRESH_INTERVAL_MINUTES)
+
 
 ensure_radio_running()
 

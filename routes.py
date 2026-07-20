@@ -6,6 +6,7 @@ from yt_radio import (
     BITRATE_KBPS,
     META_INTERVAL_SECONDS,
     PLAYLIST,
+    PLAYLIST_LOCK,
     RANDOMIZE_PLAYLIST,
     RADIO_THREAD,
     SITE_IMAGE,
@@ -29,9 +30,12 @@ def home():
 
 @app.route("/playlist.m3u")
 def playlist_route():
-    if not PLAYLIST:
+    with PLAYLIST_LOCK:
+        playlist_snapshot = list(PLAYLIST)
+
+    if not playlist_snapshot:
         return Response("#EXTM3U\n", mimetype="audio/x-mpegurl")
-    indices = list(range(len(PLAYLIST)))
+    indices = list(range(len(playlist_snapshot)))
     if RANDOMIZE_PLAYLIST:
         random.shuffle(indices)
 
@@ -57,7 +61,7 @@ def playlist_route():
         except Exception:
             duration_int = -1
         lines.append(f"#EXTINF:{duration_int},{artist} - {title}")
-        lines.append(PLAYLIST[i])
+        lines.append(playlist_snapshot[i])
     body = "\n".join(lines) + "\n"
     return Response(body, mimetype="audio/x-mpegurl")
 
@@ -166,9 +170,13 @@ def now_playing():
 
 @app.route("/tracks")
 def tracks():
+    with PLAYLIST_LOCK:
+        playlist_snapshot = list(PLAYLIST)
+        metadata_snapshot = dict(METADATA)
+
     track_list = []
-    for i, url in enumerate(PLAYLIST):
-        meta = METADATA.get(i, {"title": f"Track {i+1}", "artist": "Unknown", "duration": -1})
+    for i, url in enumerate(playlist_snapshot):
+        meta = metadata_snapshot.get(i, {"title": f"Track {i+1}", "artist": "Unknown", "duration": -1})
         track_list.append(
             {
                 "index": i,
