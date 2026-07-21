@@ -193,16 +193,24 @@ def _playlist_refresh_loop():
         refresh_playlist()
 
 
-# Bootstrap with initial playlist load
-PLAYLIST = convert_playlist_to_links(PLAYLIST_URL)
-PRELOAD_COUNT = min(4, len(PLAYLIST))
-if PRELOAD_COUNT:
-    _preload_indices = random.sample(range(len(PLAYLIST)), PRELOAD_COUNT)
-    for i in _preload_indices:
-        threading.Thread(target=fetch_metadata, args=(i, PLAYLIST[i]), daemon=True).start()
-logger.info("Playlist loaded: %d tracks (preloading %d)", len(PLAYLIST), PRELOAD_COUNT)
-logger.info("Stream available at %s/stream", BASE_URL)
-logger.info("M3U available at %s/playlist.m3u", BASE_URL)
+# Bootstrap: load the playlist in a background daemon thread so a slow or
+# hung YouTube fetch never blocks the gunicorn worker from booting / serving.
+# The app tolerates an empty PLAYLIST (routes return empty responses; the
+# radio producer loop logs "Playlist is empty" and sleeps until tracks arrive).
+# refresh_playlist() swallows fetch failures by logging and returning, so the
+# worker always becomes ready regardless of YouTube's mood.
+PLAYLIST = []
+
+def _initial_playlist_load():
+    refresh_playlist()
+    with PLAYLIST_LOCK:
+        logger.info("Playlist loaded: %d tracks", len(PLAYLIST))
+    logger.info("Stream available at %s/stream", BASE_URL)
+    logger.info("M3U available at %s/playlist.m3u", BASE_URL)
+
+_bootstrap_thread = threading.Thread(target=_initial_playlist_load, daemon=True)
+_bootstrap_thread._yt_radio_bootstrap = True
+_bootstrap_thread.start()
 
 
 

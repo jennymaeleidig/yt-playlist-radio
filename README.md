@@ -46,148 +46,22 @@ PLAYLIST_REFRESH_INTERVAL_MINUTES=60
 
 ## Deployment
 
-This section covers running `yt-playlist-radio` on a VPS or cloud instance with a reverse proxy and HTTPS. It assumes a Debian/Ubuntu-like server.
+There are two free ways to host `yt-playlist-radio`. Both end with the station auto-starting via systemd.
 
-### 1. Server requirements
+### A. Oracle Cloud Free Tier (deployed, always-on)
 
-- **OS**: Ubuntu 22.04 LTS (or similar)
-- **RAM/CPU**: 1 GB RAM and 1 CPU is plenty for a small personal stream
-- **Dependencies**: `git`, `python3`, `uv`, `nginx`, `certbot`
+An **Always Free** Ampere A1 instance (2 OCPU / 12 GB) running **Oracle Linux**, fronted by Nginx + Certbot for a public HTTPS endpoint. Best when you want a stable, always-on server on a datacenter connection, or expect more than a couple of listeners.
 
-### 2. Clone and install
+-> [docs/DEPLOY-ORACLE.md](docs/DEPLOY-ORACLE.md)
 
-```bash
-sudo apt update
-sudo apt install -y git python3 nginx certbot python3-certbot-nginx
+### B. Raspberry Pi + Cloudflare Tunnel (self-hosted, home)
 
-# Install uv if you don't have it
-curl -LsSf https://astral.sh/uv/install.sh | sh
+Run it on a home Pi with **no Nginx, no Certbot, and no router port forwarding**. `cloudflared` dials out to Cloudflare's edge, so it works behind carrier-grade NAT and keeps your home IP private. Best for a personal station with 1–5 listeners.
 
-git clone https://github.com/pinapelz/yt-playlist-radio.git /opt/yt-playlist-radio
-cd /opt/yt-playlist-radio
+-> [docs/DEPLOY-PI.md](docs/DEPLOY-PI.md)
 
-uv sync
-```
+### Choosing
 
-### 3. Configure environment
-
-Copy the template and edit:
-
-```bash
-cp .env.template .env
-nano .env
-```
-
-At minimum set:
-
-```
-PLAYLIST_URL="https://www.youtube.com/playlist?list=..."
-BASE_URL="https://radio.example.com"
-```
-
-### 4. Run with systemd
-
-Create a service so the app starts on boot and restarts if it crashes:
-
-```bash
-sudo nano /etc/systemd/system/yt-radio.service
-```
-
-```ini
-[Unit]
-Description=YouTube Playlist Radio
-After=network.target
-
-[Service]
-Type=simple
-User=www-data
-Group=www-data
-WorkingDirectory=/opt/yt-playlist-radio
-Environment="PATH=/opt/yt-playlist-radio/.venv/bin"
-EnvironmentFile=/opt/yt-playlist-radio/.env
-ExecStart=/opt/yt-playlist-radio/.venv/bin/gunicorn routes:app --bind 127.0.0.1:8000 -k gthread --threads 50 --workers 1 --timeout 0 --keep-alive 5
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Then enable and start it:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable yt-radio
-sudo systemctl start yt-radio
-```
-
-Check logs with:
-
-```bash
-sudo journalctl -u yt-radio -f
-```
-
-### 5. Configure Nginx
-
-Create a site config:
-
-```bash
-sudo nano /etc/nginx/sites-available/yt-radio
-```
-
-```nginx
-server {
-    listen 80;
-    server_name radio.example.com;
-
-    location / {
-        proxy_pass http://127.0.0.1:8000;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-
-        # Important for long-lived /stream connections
-        proxy_buffering off;
-        proxy_read_timeout 86400;
-        proxy_send_timeout 86400;
-    }
-}
-```
-
-Enable it:
-
-```bash
-sudo ln -s /etc/nginx/sites-available/yt-radio /etc/nginx/sites-enabled/
-sudo rm /etc/nginx/sites-enabled/default  # optional
-sudo nginx -t
-sudo systemctl restart nginx
-```
-
-### 6. HTTPS with Certbot
-
-```bash
-sudo certbot --nginx -d radio.example.com
-```
-
-Certbot will modify the Nginx config automatically. Renewal is handled by a systemd timer.
-
-### 7. Firewall
-
-Open the ports Nginx listens on:
-
-```bash
-sudo ufw allow OpenSSH
-sudo ufw allow 'Nginx Full'
-sudo ufw enable
-```
-
-Or if using another firewall (e.g., Oracle Cloud, AWS, etc.), open **TCP 80**, **TCP 443**, and **TCP 22** at the cloud provider level as well as on the instance.
-
-### 8. Verify
-
-Open `https://radio.example.com` in a browser, or test the stream with:
-
-```bash
-curl -I https://radio.example.com/stream
-```
+- **Need it always-on / more listeners / better bandwidth?** → Oracle Cloud (A).
+- **No public IP / behind CGNAT / want zero cloud cost / small audience?** → Raspberry Pi + Tunnel (B).
+- Both routes share the same codebase — only the hosting and the network exposure differ.
