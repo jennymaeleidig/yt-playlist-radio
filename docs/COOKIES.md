@@ -16,7 +16,7 @@ This guide is the app-specific version of the official yt-dlp docs:
 `yt_radio.py` reads a `COOKIES_FILE` environment variable and injects `--cookies <path>` into **both** yt-dlp invocations (metadata fetch and stream download). Add it to `.env`:
 
 ```env
-COOKIES_FILE=/opt/yt-playlist-radio/cookies.txt
+COOKIES_FILE=/home/pi/yt-playlist-radio/cookies.txt
 ```
 
 Leave it unset (or blank) on IPs that aren't bot-blocked — yt-dlp then runs without cookies.
@@ -38,13 +38,13 @@ YouTube rotates cookies on open browser tabs, so you must export from a session 
 
 ```bash
 # from your laptop
-scp -i ~/.ssh/your-oracle-key cookies.txt opc@YOUR_INSTANCE_IP:/opt/yt-playlist-radio/cookies.txt
+scp cookies.txt pi@YOUR_PI_HOST:~/yt-playlist-radio/cookies.txt
 ```
 
 ```bash
 # on the server
-chmod 600 /opt/yt-playlist-radio/cookies.txt      # keep it private
-head -1 /opt/yt-playlist-radio/cookies.txt        # confirm the header line
+chmod 600 /home/pi/yt-playlist-radio/cookies.txt      # keep it private
+head -1 /home/pi/yt-playlist-radio/cookies.txt        # confirm the header line
 ```
 
 ## 4. Test before restarting the app
@@ -52,12 +52,12 @@ head -1 /opt/yt-playlist-radio/cookies.txt        # confirm the header line
 Run the exact command the app uses for metadata, now with cookies:
 
 ```bash
-cd /opt/yt-playlist-radio
+cd /home/pi/yt-playlist-radio
 PLAYLIST_URL=$(grep -E '^PLAYLIST_URL=' .env | cut -d= -f2- | tr -d '"')
 FIRST_URL=$(.venv/bin/yt-dlp --flat-playlist --skip-download -J "$PLAYLIST_URL" 2>/dev/null \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['entries'][0]['url'])")
 
-.venv/bin/yt-dlp --cookies /opt/yt-playlist-radio/cookies.txt --dump-json "$FIRST_URL"
+.venv/bin/yt-dlp --cookies /home/pi/yt-playlist-radio/cookies.txt --dump-json "$FIRST_URL"
 echo "exit: $?"
 ```
 
@@ -67,7 +67,7 @@ echo "exit: $?"
 ## 5. Restart and verify
 
 ```bash
-# ensure .env has: COOKIES_FILE=/opt/yt-playlist-radio/cookies.txt
+# ensure .env has: COOKIES_FILE=/home/pi/yt-playlist-radio/cookies.txt
 sudo systemctl restart yt-radio
 sudo journalctl -u yt-radio -n 20 --no-pager
 # expect "Playlist loaded: N tracks" and NO "Failed to get metadata from yt-dlp"

@@ -46,28 +46,16 @@ PLAYLIST_REFRESH_INTERVAL_MINUTES=60
 
 ## Deployment
 
-There are two free ways to host `yt-playlist-radio`. Both end with the station auto-starting via systemd.
+The only supported way to host `yt-playlist-radio`:
 
-### A. Oracle Cloud Free Tier (deployed, always-on)
+### Raspberry Pi + Cloudflare Tunnel (self-hosted, home)
 
-An **Always Free** Ampere A1 instance (2 OCPU / 12 GB) running **Oracle Linux**, fronted by Nginx + Certbot for a public HTTPS endpoint. Best when you want a stable, always-on server on a datacenter connection, or expect more than a couple of listeners.
-
--> [docs/DEPLOY-ORACLE.md](docs/DEPLOY-ORACLE.md)
-
-### B. Raspberry Pi + Cloudflare Tunnel (self-hosted, home)
-
-Run it on a home Pi with **no Nginx, no Certbot, and no router port forwarding**. `cloudflared` dials out to Cloudflare's edge, so it works behind carrier-grade NAT and keeps your home IP private. Best for a personal station with 1–5 listeners.
+Run it on a home Pi with **no Nginx, no Certbot, and no router port forwarding**. `cloudflared` dials out to Cloudflare's edge, so it works behind carrier-grade NAT and keeps your home IP private. A home IP also avoids the YouTube bot-blocking that datacenter IPs run into, so yt-dlp fetches work without extra auth.
 
 -> [docs/DEPLOY-PI.md](docs/DEPLOY-PI.md)
 
-### Choosing
+### YouTube cookies (bot blocks)
 
-- **Need it always-on / more listeners / better bandwidth?** → Oracle Cloud (A).
-- **No public IP / behind CGNAT / want zero cloud cost / small audience?** → Raspberry Pi + Tunnel (B).
-- Both routes share the same codebase — only the hosting and the network exposure differ.
-
-### YouTube cookies (bot blocks / datacenter IPs)
-
-If yt-dlp returns **"Sign in to confirm you're not a bot"** (common from cloud datacenter IPs), pass authenticated browser cookies via the `COOKIES_FILE` env var. The app injects `--cookies` into both its metadata and stream yt-dlp calls.
+If yt-dlp ever returns **"Sign in to confirm you're not a bot"**, pass authenticated browser cookies via the `COOKIES_FILE` env var. The app injects `--cookies` into both its metadata and stream yt-dlp calls. Rarely needed on a home connection.
 
 -> [docs/COOKIES.md](docs/COOKIES.md)

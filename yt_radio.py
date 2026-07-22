@@ -34,7 +34,7 @@ YTDLP_FORMAT = os.environ.get(
 )
 
 # Path to a cookies.txt file for YouTube auth. Required when YouTube bot-blocks
-# the server's datacenter IP — export cookies from a logged-in browser session.
+# the server's IP — export cookies from a logged-in browser session.
 # When unset, yt-dlp runs without cookies (works from non-flagged IPs).
 COOKIES_FILE = os.environ.get("COOKIES_FILE")
 
