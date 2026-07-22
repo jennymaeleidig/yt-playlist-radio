@@ -31,8 +31,15 @@ META_INTERVAL_SECONDS = int(os.environ.get("META_INTERVAL_SECONDS", "5"))
 # YouTube experiments that make pure audio-only formats unavailable.
 YTDLP_FORMAT = os.environ.get(
     "YTDLP_FORMAT", "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best"
-),
+)
 
+# Path to a cookies.txt file for YouTube auth. Required when YouTube bot-blocks
+# the server's datacenter IP — export cookies from a logged-in browser session.
+# When unset, yt-dlp runs without cookies (works from non-flagged IPs).
+COOKIES_FILE = os.environ.get("COOKIES_FILE")
+
+# Shared base argv for yt-dlp media extraction so metadata + stream paths stay in sync.
+_YTDLP_BASE_ARGS = ["yt-dlp"] + (["--cookies", COOKIES_FILE] if COOKIES_FILE else [])
 # optional / page
 SITE_TITLE = os.environ.get("SITE_TITLE", "yt_radio.py")
 SITE_IMAGE = os.environ.get("SITE_IMAGE", "")
@@ -149,7 +156,7 @@ def fetch_metadata(index, url):
     # Get metadata via yt-dlp
     try:
         result = subprocess.run(
-            ["yt-dlp", "--dump-json", url],
+            _YTDLP_BASE_ARGS + ["--dump-json", url],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -240,7 +247,7 @@ def _stream_track(index, url=None):
     ffmpeg_err = tempfile.TemporaryFile()
 
     ytdlp = subprocess.Popen(
-        ["yt-dlp", "-f", YTDLP_FORMAT, "-o", "-", url],
+        _YTDLP_BASE_ARGS + ["-f", YTDLP_FORMAT, "-o", "-", url],
         stderr=ytdlp_err,
     )
 

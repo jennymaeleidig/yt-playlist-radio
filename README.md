@@ -65,3 +65,9 @@ Run it on a home Pi with **no Nginx, no Certbot, and no router port forwarding**
 - **Need it always-on / more listeners / better bandwidth?** → Oracle Cloud (A).
 - **No public IP / behind CGNAT / want zero cloud cost / small audience?** → Raspberry Pi + Tunnel (B).
 - Both routes share the same codebase — only the hosting and the network exposure differ.
+
+### YouTube cookies (bot blocks / datacenter IPs)
+
+If yt-dlp returns **"Sign in to confirm you're not a bot"** (common from cloud datacenter IPs), pass authenticated browser cookies via the `COOKIES_FILE` env var. The app injects `--cookies` into both its metadata and stream yt-dlp calls.
+
+-> [docs/COOKIES.md](docs/COOKIES.md)

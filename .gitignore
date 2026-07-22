@@ -12,3 +12,6 @@ wheels/
 
 # Cache
 cache.json
+
+# YouTube auth (see docs/COOKIES.md) — never commit cookies
+cookies.txt
