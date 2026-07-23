@@ -40,6 +40,29 @@ COOKIES_FILE = os.environ.get("COOKIES_FILE")
 
 # Shared base argv for yt-dlp media extraction so metadata + stream paths stay in sync.
 _YTDLP_BASE_ARGS = ["yt-dlp"] + (["--cookies", COOKIES_FILE] if COOKIES_FILE else [])
+# Optional one-shot: if yt-dlp is 403-blocked/bot-walled, point the
+# operator at COOKIES_FILE once so a persistent block doesn't spam every track.
+_cookies_recommended = threading.Event()
+
+
+def _maybe_log_cookies_recommendation(ytdlp_stderr: str) -> None:
+    '''If yt-dlp failed with an HTTP 403 (or the YouTube bot-wall), log a
+    one-time recommendation. From a bot-flagged IP the media download 403s
+    even when metadata fetches succeed, so affected tracks are otherwise
+    silently skipped with no clue why. The remedy is to pass authenticated
+    browser cookies via COOKIES_FILE.
+    '''
+    if _cookies_recommended.is_set() or not ytdlp_stderr:
+        return
+    if ("403" in ytdlp_stderr and "Forbidden" in ytdlp_stderr) or "Sign in to confirm you're not a bot" in ytdlp_stderr:
+        _cookies_recommended.set()
+        where = "COOKIES_FILE is not set" if not COOKIES_FILE else f"COOKIES_FILE={COOKIES_FILE} (expired or wrong session?)"
+        logger.error(
+            "yt-dlp is being blocked by YouTube (403 Forbidden / bot-wall); %s. "
+            "Export browser cookies and set COOKIES_FILE in .env — see docs/COOKIES.md. "
+            "Affected tracks will be skipped until then.",
+            where,
+        )
 # optional / page
 SITE_TITLE = os.environ.get("SITE_TITLE", "yt_radio.py")
 SITE_IMAGE = os.environ.get("SITE_IMAGE", "")
@@ -165,6 +188,7 @@ def fetch_metadata(index, url):
         )
         if result.returncode != 0 or not result.stdout:
             logger.error("Failed to get metadata from yt-dlp, you may or may not be throttled!")
+            _maybe_log_cookies_recommendation(result.stderr or "")
             raise RuntimeError(f"yt-dlp failed for {url}: {result.stderr.strip()}")
         data = json.loads(result.stdout)
         METADATA[index] = {
@@ -192,6 +216,8 @@ def fetch_metadata(index, url):
         logger.debug("Failed to fetch metadata for index %s, using fallback", index)
 
 def _playlist_refresh_loop():
+    if PLAYLIST_REFRESH_INTERVAL_MINUTES <= 0:
+        return  # auto-refresh disabled; the bootstrap load handles the first fetch
     while not RADIO_STOP.is_set():
         # Wait for the refresh interval, but wake up quickly if the app stops
         RADIO_STOP.wait(timeout=PLAYLIST_REFRESH_INTERVAL_MINUTES * 60)
@@ -248,6 +274,7 @@ def _stream_track(index, url=None):
 
     ytdlp = subprocess.Popen(
         _YTDLP_BASE_ARGS + ["-f", YTDLP_FORMAT, "-o", "-", url],
+        stdout=subprocess.PIPE,
         stderr=ytdlp_err,
     )
 
@@ -313,6 +340,7 @@ def _stream_track(index, url=None):
             yerr = ytdlp_err.read().decode("utf-8", errors="replace")
             if yerr:
                 logger.warning("yt-dlp stderr for track %d: %s", index + 1, yerr.strip())
+                _maybe_log_cookies_recommendation(yerr)
         except Exception:
             logger.exception("Failed to read subprocess stderr")
         finally:
