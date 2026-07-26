@@ -62,8 +62,6 @@ The only supported way to host `yt-playlist-radio`:
 
 Run it on a home Pi with **no Nginx, no Certbot, and no router port forwarding**. `cloudflared` dials out to Cloudflare's edge, so it works behind carrier-grade NAT and keeps your home IP private. A home IP also avoids the YouTube bot-blocking that datacenter IPs run into, so yt-dlp fetches work without extra auth.
 
--> [docs/DEPLOY-PI.md](docs/DEPLOY-PI.md)
-
 ### YouTube cookies (bot blocks)
 
 If yt-dlp ever returns **"Sign in to confirm you're not a bot"** (or an HTTP 403 on media downloads), pass authenticated browser cookies via the `COOKIES_FILE` env var. The app injects `--cookies` into both its metadata and stream yt-dlp calls. Rarely needed on a home connection.
