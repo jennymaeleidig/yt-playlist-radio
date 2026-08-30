@@ -1,6 +1,6 @@
 from yt_dlp import YoutubeDL
 from file_util import _load_urls_from_file, _create_or_get_cache, _save_cache
-import subprocess
+from transport import Transport
 import json
 import threading
 import random
@@ -10,7 +10,6 @@ import logging
 import time
 from queue import Queue
 import uuid
-import tempfile
 
 
 load_dotenv()
@@ -38,8 +37,11 @@ YTDLP_FORMAT = os.environ.get(
 # When unset, yt-dlp runs without cookies (works from non-flagged IPs).
 COOKIES_FILE = os.environ.get("COOKIES_FILE")
 
-# Shared base argv for yt-dlp media extraction so metadata + stream paths stay in sync.
-_YTDLP_BASE_ARGS = ["yt-dlp"] + (["--cookies", COOKIES_FILE] if COOKIES_FILE else [])
+# The single transport object through which every yt-dlp / ffmpeg subprocess
+# spawn flows (see transport.py). yt-dlp is pinned to the venv's copy (run via
+# the venv interpreter); unit tests replace this object wholesale.
+TRANSPORT = Transport(cookies_file=COOKIES_FILE)
+
 # Optional one-shot: if yt-dlp is 403-blocked/bot-walled, point the
 # operator at COOKIES_FILE once so a persistent block doesn't spam every track.
 _cookies_recommended = threading.Event()
@@ -178,14 +180,7 @@ def fetch_metadata(index, url):
 
     # Get metadata via yt-dlp
     try:
-        result = subprocess.run(
-            _YTDLP_BASE_ARGS + ["--dump-json", url],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=30,
-        )
+        result = TRANSPORT.run_ytdlp(["--dump-json", url])
         if result.returncode != 0 or not result.stdout:
             logger.error("Failed to get metadata from yt-dlp, you may or may not be throttled!")
             _maybe_log_cookies_recommendation(result.stderr or "")
@@ -313,33 +308,11 @@ def _stream_track(index, url=None):
     meta = dict(METADATA.get(index, {"title": f"Track {index+1}", "artist": "Unknown", "duration": -1, "id": ""}))
     logger.info("Now playing [%d/%d]: %s - %s", index + 1, len(PLAYLIST), meta.get("artist", ""), meta.get("title", ""))
 
-    ytdlp_err = tempfile.TemporaryFile()
-    ffmpeg_err = tempfile.TemporaryFile()
-
-    ytdlp = subprocess.Popen(
-        _YTDLP_BASE_ARGS + ["-f", YTDLP_FORMAT, "-o", "-", url],
-        stdout=subprocess.PIPE,
-        stderr=ytdlp_err,
+    # Single transport seam: both children (yt-dlp | ffmpeg) are spawned and
+    # owned by the transport; we only read the transcoded stdout.
+    pipeline = TRANSPORT.open_track_pipeline(
+        url, ytdlp_format=YTDLP_FORMAT, bitrate_kbps=BITRATE_KBPS
     )
-
-    ffmpeg = subprocess.Popen(
-        [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel", "error",
-            "-i", "pipe:0",
-            "-f", "mp3",
-            "-ab", f"{BITRATE_KBPS}k",
-            "-ar", "44100",
-            "-ac", "2",
-            "pipe:1",
-        ],
-        stdin=ytdlp.stdout,
-        stdout=subprocess.PIPE,
-        stderr=ffmpeg_err,
-    )
-    if ytdlp.stdout:
-        ytdlp.stdout.close()
 
     bytes_per_sec = (BITRATE_KBPS * 1000) // 8
     burst_bytes = bytes_per_sec * BURST_SECONDS
@@ -348,10 +321,10 @@ def _stream_track(index, url=None):
 
     try:
         while True:
-            if ffmpeg.stdout is None:
+            if pipeline.stdout is None:
                 logger.warning("No stdout available from FFMPEG")
                 break
-            chunk = ffmpeg.stdout.read(8192)
+            chunk = pipeline.stdout.read(8192)
             if not chunk:
                 break
             bytes_sent += len(chunk)
@@ -363,39 +336,18 @@ def _stream_track(index, url=None):
                 sleep_for = (bytes_sent - expected_bytes) / bytes_per_sec
                 time.sleep(sleep_for)
     finally:
-        try:
-            ffmpeg.kill()
-        except Exception:
-            pass
-        try:
-            ytdlp.kill()
-        except Exception:
-            pass
-        ffmpeg.wait()
-        ytdlp.wait()
+        # close() kills + reaps both children and drains their stderr.
+        ffmpeg_err, ytdlp_err = pipeline.close()
         elapsed = time.monotonic() - start_time
         logger.info("Finished sending [%d/%d]: %r - %r (bytes_sent=%d, elapsed=%.2fs)", index + 1, len(PLAYLIST), meta.get("artist"), meta.get("title"), bytes_sent, elapsed)
         try:
-            ffmpeg_err.seek(0)
-            ferr = ffmpeg_err.read().decode("utf-8", errors="replace")
-            if ferr:
-                logger.warning("ffmpeg stderr for track %d: %s", index + 1, ferr.strip())
-            ytdlp_err.seek(0)
-            yerr = ytdlp_err.read().decode("utf-8", errors="replace")
-            if yerr:
-                logger.warning("yt-dlp stderr for track %d: %s", index + 1, yerr.strip())
-                _maybe_log_cookies_recommendation(yerr)
+            if ffmpeg_err:
+                logger.warning("ffmpeg stderr for track %d: %s", index + 1, ffmpeg_err.strip())
+            if ytdlp_err:
+                logger.warning("yt-dlp stderr for track %d: %s", index + 1, ytdlp_err.strip())
+                _maybe_log_cookies_recommendation(ytdlp_err)
         except Exception:
-            logger.exception("Failed to read subprocess stderr")
-        finally:
-            try:
-                ffmpeg_err.close()
-            except Exception:
-                pass
-            try:
-                ytdlp_err.close()
-            except Exception:
-                pass
+            logger.exception("Failed to log subprocess stderr")
 
 
 def add_subscriber():

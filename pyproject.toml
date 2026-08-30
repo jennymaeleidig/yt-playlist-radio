@@ -9,6 +9,10 @@ dependencies = [
     "gunicorn>=25.1.0",
     "python-dotenv>=1.2.1",
     "yt-dlp>=2026.2.4",
+    # JS challenge solver for yt-dlp; without it the venv's yt-dlp cannot
+    # solve YouTube signature challenges (the PATH binary bundled it, which
+    # masked the gap until yt-dlp was venv-pinned).
+    "yt-dlp-ejs>=0.8.0",
 ]
 
 [dependency-groups]
