@@ -1,0 +1,8 @@
+# Small deterministic playlist for integration tests (first URLs of kpop.radio).
+# Integration tests parse this locally — no network for the listing itself;
+# metadata and media still hit real YouTube from the home IP.
+https://www.youtube.com/watch?v=IhbJIxII5qQ
+https://www.youtube.com/watch?v=CQSY6FeT68I
+https://www.youtube.com/watch?v=hcMktKzONYs
+https://www.youtube.com/watch?v=sJDAXF4pS1A
+https://www.youtube.com/watch?v=tEF6aKhfPaQ

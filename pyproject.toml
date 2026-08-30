@@ -10,3 +10,18 @@ dependencies = [
     "python-dotenv>=1.2.1",
     "yt-dlp>=2026.2.4",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-timeout>=2.4.0",
+]
+
+[tool.pytest.ini_options]
+# Integration (and later smoke) tests hit the real network; they are
+# deselected by default so a plain `pytest` run is hermetic unit-only.
+addopts = "-m 'not integration' --timeout=120 --timeout-method=thread"
+markers = [
+    "unit: fast, hermetic tests (no network) — the default run",
+    "integration: direct-mode tests against real YouTube from the home IP (deselected by default)",
+]

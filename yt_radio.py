@@ -66,8 +66,8 @@ def _maybe_log_cookies_recommendation(ytdlp_stderr: str) -> None:
 # optional / page
 SITE_TITLE = os.environ.get("SITE_TITLE", "yt_radio.py")
 SITE_IMAGE = os.environ.get("SITE_IMAGE", "")
-if not PLAYLIST_URL:
-    raise RuntimeError("Please set PLAYLIST_URL environment variable")
+# NOTE: the PLAYLIST_URL presence check moved into start_background_work() so
+# that importing this module stays side-effect-free (unit tests import it).
 
 METADATA = {}
 NOW_PLAYING = {"index": None, "title": "Nothing", "artist": "Unknown", "id": ""}
@@ -226,12 +226,14 @@ def _playlist_refresh_loop():
         refresh_playlist()
 
 
-# Bootstrap: load the playlist in a background daemon thread so a slow or
-# hung YouTube fetch never blocks the gunicorn worker from booting / serving.
 # The app tolerates an empty PLAYLIST (routes return empty responses; the
 # radio producer loop logs "Playlist is empty" and sleeps until tracks arrive).
 # refresh_playlist() swallows fetch failures by logging and returning, so the
 # worker always becomes ready regardless of YouTube's mood.
+#
+# refresh_playlist() REBINDS PLAYLIST (and resets METADATA) under the lock;
+# nothing may hold a from-imported reference to it — consumers read it via
+# playlist_snapshot(), which re-reads the global on every call.
 PLAYLIST = []
 
 def _initial_playlist_load():
@@ -241,13 +243,55 @@ def _initial_playlist_load():
     logger.info("Stream available at %s/stream", BASE_URL)
     logger.info("M3U available at %s/playlist.m3u", BASE_URL)
 
-_bootstrap_thread = threading.Thread(target=_initial_playlist_load, daemon=True)
-_bootstrap_thread._yt_radio_bootstrap = True
-_bootstrap_thread.start()
+_background_started = False
+
+def start_background_work(force: bool = False):
+    """Start the bootstrap playlist load and the auto-refresh loop.
+
+    Invoked by the webapp factory when the real radio module is used — never
+    at import time, so importing this module has no side effects. Idempotent;
+    `force=True` re-runs the bootstrap load (integration tests use it to
+    repoint PLAYLIST_URL).
+    """
+    global _background_started
+    if not PLAYLIST_URL:
+        raise RuntimeError("Please set PLAYLIST_URL environment variable")
+    if _background_started and not force:
+        return
+    _background_started = True
+    # Load the playlist in a background daemon thread so a slow or hung
+    # YouTube fetch never blocks the gunicorn worker from booting / serving.
+    threading.Thread(target=_initial_playlist_load, daemon=True).start()
+    ensure_playlist_refresh_running()
+
+def playlist_snapshot():
+    """Live playlist copy under PLAYLIST_LOCK. The injection surface the
+    webapp consumes instead of from-importing PLAYLIST."""
+    with PLAYLIST_LOCK:
+        return list(PLAYLIST)
+
+def metadata_snapshot():
+    """Live metadata copy under PLAYLIST_LOCK (same injection surface)."""
+    with PLAYLIST_LOCK:
+        return dict(METADATA)
+
+def now_playing_snapshot():
+    return dict(NOW_PLAYING)
+
+def update_now_playing(chunk_index, meta):
+    """Record the track a stream chunk belongs to (icy-metadata + /now_playing)."""
+    NOW_PLAYING["index"] = chunk_index
+    NOW_PLAYING["title"] = meta.get("title", "")
+    NOW_PLAYING["artist"] = meta.get("artist", "")
+    NOW_PLAYING["id"] = meta.get("id", "")
+
+def radio_thread():
+    """The radio producer thread, or None if it has never started."""
+    return RADIO_THREAD
 
 
 
-def _ensure_metadata(index):
+def ensure_metadata(index):
     if index in METADATA:
         return
     with PLAYLIST_LOCK:
@@ -265,7 +309,7 @@ def _stream_track(index, url=None):
                 logger.warning("Track index %d is out of range after playlist refresh", index)
                 return
             url = PLAYLIST[index]
-    _ensure_metadata(index)
+    ensure_metadata(index)
     meta = dict(METADATA.get(index, {"title": f"Track {index+1}", "artist": "Unknown", "duration": -1, "id": ""}))
     logger.info("Now playing [%d/%d]: %s - %s", index + 1, len(PLAYLIST), meta.get("artist", ""), meta.get("title", ""))
 
@@ -442,7 +486,8 @@ def ensure_playlist_refresh_running():
     logger.info("Playlist refresh thread started (interval=%d minutes)", PLAYLIST_REFRESH_INTERVAL_MINUTES)
 
 
-ensure_radio_running()
+# The radio producer is started lazily by the /stream route (ensure_radio_running);
+# background playlist work is started by the webapp factory (start_background_work).
 
 if __name__ == "__main__":
     from routes import app
