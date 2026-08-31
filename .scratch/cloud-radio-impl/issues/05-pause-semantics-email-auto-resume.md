@@ -55,9 +55,7 @@ Authorization header and is never logged (pinned by test).
   imports dropped. Kept (documented judgement call): the defensive error
   boundary in `_send_pause_alert` — the seam contract is send() never
   raises, but the pause path must survive any seam implementation.
-- `pytest -m integration`: NOT re-verified from this session — the agent
-  sandbox currently denies all network (curl to youtube.com/resend.com fails
-  with EPERM), so the 4 direct-mode tests fail on network, not code. The
-  same suite passed from this session during issue 04. Re-run
-  `pytest -m integration` from a network-capable shell to confirm the
-  streaming path end-to-end.
+- `pytest -m integration`: 4 passed, and `pytest -m proxied`: 2 passed —
+  verified by the user from a network-capable shell after this session (the
+  agent sandbox denies all network, so its own run failed on EPERM, not
+  code). Streaming works end-to-end direct and through the proxy.
