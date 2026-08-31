@@ -73,3 +73,50 @@
   in the swappiness test, unused `script_text` fixture param in the syntax-gate tests,
   and redundant assertion alternations — all cleaned up. The regex-over-script-text
   seam is a documented, deliberate tradeoff, not flagged further.
+
+**HANDOFF (waiting on capacity — next session continues here)**
+
+*State: provisioning script + tests are committed (46d1f8a, review-clean).
+Blocked on real-VM verification because the original VM died mid-provision.*
+
+- **Original VM (E2.1.Micro, 1 GB, 150.136.169.22) wedged** during
+  `provision.sh` — the ffmpeg dnf transaction OOM-thrashed the 1 GB box;
+  SSH now hangs. Reboot was attempted; decision made to replace it rather
+  than resurrect it. Terminate it once the replacement is up.
+- **Pivot: replacement is an A1.Flex (aarch64)**, spawned via the user's
+  fork of github.com/krishnasmanisai/oracle-a1-creator (audited: clean —
+  GitHub Secrets only, official OCI SDK; the alternative kawishkamd spawner
+  was rejected for asking users to paste OCI keys into repo files).
+  User's fork: github.com/jennymaeleidig/oracle-a1-creator — fixed
+  `boot_volume_vpus_per_gb` 120→10 (Always Free is Balanced; 120 bills).
+- **Instance config chosen: 1 OCPU / 6 GB RAM / 20 GB boot** — deviates
+  from issue 11's "E2.1.Micro, ≥47 GB boot" spec. Deliberate: 6 GB ends the
+  OOM problem; 20 GB is ample for the app. Issues 07/08/11 should be read
+  with the A1 shape in mind (affects 07 sizing notes + 11's launch params;
+  update those tickets when their turns come).
+- **Stack is ARM-clean** (checked): rpmfusion ffmpeg ships aarch64, uv +
+  Python 3.13 + nodejs all fine. `provision.sh` needs no changes for arch.
+  *One improvement owed*: move swap creation BEFORE the dnf phases in
+  provision.sh so low-RAM boxes survive the transaction (general
+  robustness; the 6 GB A1 doesn't need it).
+- **Wizard for verification exists**: `.scratch/cloud-radio-impl/vm-verify-06.sh`
+  (ephemeral, uncommitted). Stages: ssh check (key `~/.ssh/yt-radio`) →
+  git archive + provision → secrets into VM .env (hidden entry) → start app
+  + page/stream checks → idempotent re-run + invariants. It prompts for the
+  VM IP, so it works for the A1 unchanged once it exists.
+- **Waiting on**: the GitHub Actions workflow on the user's fork polling
+  every 5 min for A1 capacity; "Out of capacity (500)" is normal, can take
+  hours/days. On SUCCESS it prints the public IP; user then disables the
+  workflow and reports the IP.
+
+**Next agent's first moves (in order):**
+1. Get the A1 public IP from the user (or OCI console).
+2. Terminate the old micro (user, via console).
+3. Edit `provision.sh`: hoist swap provisioning above the dnf phases
+   (idempotent guard already exists), rerun tests, commit.
+4. Run `.scratch/cloud-radio-impl/vm-verify-06.sh` with the user — stages
+   2–5 produce the evidence for the two open checkboxes (manual
+   start/stream; clean re-run).
+5. Tick checkboxes, set Status: done, then proceed to issue 07
+   (gunicorn/nginx/TLS/firewalld — claimed, not started; user-side steps
+   there: DNS A-record grey-cloud, OCI ingress 80/443, Resend sender).
