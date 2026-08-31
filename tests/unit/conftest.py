@@ -5,6 +5,44 @@ from queue import Queue
 
 import pytest
 
+import yt_radio
+
+
+@pytest.fixture
+def radio_state():
+    """Snapshot yt_radio's mutable module state (playlist, metadata, cache,
+    guardrails, pause/alert state) and restore it afterwards."""
+    saved = {
+        "playlist": yt_radio.PLAYLIST,
+        "metadata": dict(yt_radio.METADATA),
+        "cache": dict(yt_radio._CACHE),
+    }
+    yt_radio.METADATA.clear()
+    yt_radio._CACHE.clear()  # the temp cache file persists across runs
+    yt_radio._cookies_recommended.clear()
+    yt_radio.RADIO_STOP.clear()
+    yt_radio.PAUSED.clear()
+    yt_radio._FAILURE_BUDGET.reset()
+    yt_radio.PAUSE_INFO.clear()
+    yt_radio.LAST_TRACK_FAILURE.clear()
+    yt_radio._PAUSED_AT_MONOTONIC = None
+    yield
+    yt_radio.PLAYLIST = saved["playlist"]
+    yt_radio.METADATA.clear()
+    yt_radio.METADATA.update(saved["metadata"])
+    yt_radio._CACHE.clear()
+    yt_radio._CACHE.update(saved["cache"])
+    yt_radio._cookies_recommended.clear()
+    yt_radio.RADIO_STOP.clear()
+    yt_radio.PAUSED.clear()
+    yt_radio._FAILURE_BUDGET.reset()
+    yt_radio.PAUSE_INFO.clear()
+    yt_radio.LAST_TRACK_FAILURE.clear()
+    yt_radio._PAUSED_AT_MONOTONIC = None
+    with yt_radio.SUBSCRIBERS_LOCK:
+        yt_radio.SUBSCRIBERS.clear()
+    yt_radio.SUBSCRIBER_EVENT.clear()
+
 
 class FakeRadio:
     """In-memory stand-in for yt_radio.

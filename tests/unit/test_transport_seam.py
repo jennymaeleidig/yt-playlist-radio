@@ -113,31 +113,6 @@ def _meta_json(**overrides):
     return json.dumps(data)
 
 
-@pytest.fixture
-def radio_state():
-    """Snapshot yt_radio's mutable module state and restore it afterwards."""
-    saved = {
-        "playlist": yt_radio.PLAYLIST,
-        "metadata": dict(yt_radio.METADATA),
-        "cache": dict(yt_radio._CACHE),
-    }
-    yt_radio.METADATA.clear()
-    yt_radio._CACHE.clear()  # the temp cache file persists across runs
-    yt_radio._cookies_recommended.clear()
-    yt_radio.RADIO_STOP.clear()
-    yield
-    yt_radio.PLAYLIST = saved["playlist"]
-    yt_radio.METADATA.clear()
-    yt_radio.METADATA.update(saved["metadata"])
-    yt_radio._CACHE.clear()
-    yt_radio._CACHE.update(saved["cache"])
-    yt_radio._cookies_recommended.clear()
-    yt_radio.RADIO_STOP.clear()
-    with yt_radio.SUBSCRIBERS_LOCK:
-        yt_radio.SUBSCRIBERS.clear()
-    yt_radio.SUBSCRIBER_EVENT.clear()
-
-
 # -- metadata path (scripted exit codes) ------------------------------------
 
 class TestFetchMetadataThroughTransport:

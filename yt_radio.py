@@ -1,6 +1,7 @@
 from yt_dlp import YoutubeDL
 from file_util import _load_urls_from_file, _create_or_get_cache, _save_cache
 from transport import Transport, build_dataimpulse_proxy_url, proxied_ydl_opts
+from alerts import ResendMailer
 import json
 import re
 import sys
@@ -58,8 +59,17 @@ TRAFFIC_EXHAUSTED_PATTERNS = (
 )
 
 # How much of the failing spawn's stderr is kept for the pause path
-# (issue 05 alerting consumes this).
+# (the alert email consumes this).
 STDERR_EXCERPT_CHARS = 2000
+
+# --- Pause alerting + auto-resume (issue 05) ---------------------------------
+# After a pause the supervisor waits out this cooldown, then auto-resumes
+# with a fresh failure budget — transient proxy outages self-heal, and each
+# pause (including a re-pause after a failed resume) alerts exactly once.
+PAUSE_RESUME_COOLDOWN_MINUTES = float(
+    os.environ.get("PAUSE_RESUME_COOLDOWN_MINUTES", "30")
+)
+PAUSE_RESUME_COOLDOWN_SECONDS = PAUSE_RESUME_COOLDOWN_MINUTES * 60
 
 # Path to a cookies.txt file for YouTube auth. Required when YouTube bot-blocks
 # the server's IP — export cookies from a logged-in browser session.
@@ -96,6 +106,12 @@ if PROXY_URL:
         "Residential proxy configured: all YouTube fetches ride the proxy "
         "(one sticky session per track); COOKIES_FILE is ignored on the proxied path"
     )
+
+# The mailer seam for pause alerts (issue 05). None when alert email is not
+# configured (RESEND_API_KEY / ALERT_EMAIL_FROM / ALERT_EMAIL_TO unset) —
+# pausing then only logs. Unit tests replace this object wholesale; no test
+# ever sends real email.
+MAILER = ResendMailer.from_env()
 
 # Optional one-shot: if yt-dlp is 403-blocked/bot-walled, point the
 # operator at COOKIES_FILE once so a persistent block doesn't spam every track.
@@ -437,6 +453,7 @@ def backoff_delay(consecutive_failures: int) -> float:
 _FAILURE_BUDGET = FailureBudget()
 PAUSE_INFO = {}         # reason + counters + stderr excerpt for the pause path
 LAST_TRACK_FAILURE = {}  # url / yt-dlp exit code / full stderr of the last failure
+_PAUSED_AT_MONOTONIC = None  # time.monotonic() at pause; drives the auto-resume cooldown
 
 
 def _traffic_exhausted(ytdlp_stderr) -> bool:
@@ -447,9 +464,10 @@ def _traffic_exhausted(ytdlp_stderr) -> bool:
 
 
 def _pause_radio(reason: str, stderr: str = "") -> None:
-    """Pause the supervisor: the loop spends nothing until resume_radio().
-    Captures the counters and the failing spawn's stderr excerpt so the pause
-    path (and issue 05's alerting) can say why the radio stopped."""
+    """Pause the supervisor: the loop spends nothing until the cooldown
+    auto-resumes it (or resume_radio() is called). Captures the counters and
+    the failing spawn's stderr excerpt, then alerts exactly once."""
+    global _PAUSED_AT_MONOTONIC
     if PAUSED.is_set():
         return
     PAUSE_INFO.clear()
@@ -460,15 +478,60 @@ def _pause_radio(reason: str, stderr: str = "") -> None:
         "failures_in_window": _FAILURE_BUDGET.failures_in_window(),
         "paused_at": time.time(),
     })
+    _PAUSED_AT_MONOTONIC = time.monotonic()
     PAUSED.set()
     logger.error("RADIO PAUSED: %s | last yt-dlp stderr: %s", reason, PAUSE_INFO["stderr_excerpt"])
+    _send_pause_alert()
+
+
+def _send_pause_alert() -> None:
+    """Email one pause alert through the mailer seam: the reason, the failure
+    counters, and the last yt-dlp stderr excerpt. A missing or failing mailer
+    never un-guards the pause."""
+    if MAILER is None:
+        logger.warning(
+            "Radio paused but alert email is not configured — "
+            "set RESEND_API_KEY, ALERT_EMAIL_FROM and ALERT_EMAIL_TO to enable alerts"
+        )
+        return
+    subject = "[yt-radio] radio paused: {}".format(PAUSE_INFO["reason"])
+    body = "\n".join([
+        "The radio supervisor paused and is spending nothing.",
+        "",
+        "Reason: {}".format(PAUSE_INFO["reason"]),
+        "Consecutive failures: {}".format(PAUSE_INFO["consecutive_failures"]),
+        "Failures in the last {} min: {}".format(
+            FAILURE_BUDGET_WINDOW_MINUTES, PAUSE_INFO["failures_in_window"]
+        ),
+        "Paused at: {}".format(
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(PAUSE_INFO["paused_at"]))
+        ),
+        "",
+        "Last yt-dlp stderr:",
+        PAUSE_INFO["stderr_excerpt"] or "(none captured)",
+        "",
+        "The radio auto-resumes with a fresh failure budget after {} minutes.".format(
+            PAUSE_RESUME_COOLDOWN_MINUTES
+        ),
+    ])
+    try:
+        if MAILER.send(subject, body):
+            logger.info("Pause alert email sent")
+        else:
+            logger.error("Pause alert email could not be sent")
+    except Exception:
+        # Defensive only: the seam contract is send() never raises, but a
+        # pause must never die over a broken mailer either way.
+        logger.exception("Pause alert email failed")
 
 
 def resume_radio() -> None:
     """Resume the supervisor loop with a fresh failure budget."""
+    global _PAUSED_AT_MONOTONIC
     PAUSED.clear()
     PAUSE_INFO.clear()
     _FAILURE_BUDGET.reset()
+    _PAUSED_AT_MONOTONIC = None
     logger.info("Radio resumed with a fresh failure budget")
 
 
@@ -646,8 +709,18 @@ def _radio_loop():
     while not RADIO_STOP.is_set():
         if PAUSED.is_set():
             # Cost guardrail: while paused the supervisor spends nothing —
-            # no spawns, no metadata fetches. Wake periodically to notice
-            # resume_radio() or shutdown.
+            # no spawns, no metadata fetches. After the cooldown it
+            # auto-resumes with a fresh failure budget so transient proxy
+            # outages self-heal; a still-broken proxy re-pauses (and
+            # re-alerts) after at most one attempt.
+            paused_at = _PAUSED_AT_MONOTONIC
+            if (
+                paused_at is not None
+                and time.monotonic() - paused_at >= PAUSE_RESUME_COOLDOWN_SECONDS
+            ):
+                logger.info("Pause cooldown elapsed; auto-resuming with a fresh failure budget")
+                resume_radio()
+                continue
             if RADIO_STOP.wait(PAUSE_POLL_SECONDS):
                 break
             continue

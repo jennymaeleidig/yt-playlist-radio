@@ -91,40 +91,6 @@ def _ok_pipeline(chunk=None):
     return FakePipeline(chunks=[chunk or (b"\xff\xfb" + b"x" * 100)])
 
 
-@pytest.fixture
-def radio_state():
-    """Snapshot yt_radio's mutable module state (including guardrail state)
-    and restore it afterwards."""
-    saved = {
-        "playlist": yt_radio.PLAYLIST,
-        "metadata": dict(yt_radio.METADATA),
-        "cache": dict(yt_radio._CACHE),
-    }
-    yt_radio.METADATA.clear()
-    yt_radio._CACHE.clear()
-    yt_radio._cookies_recommended.clear()
-    yt_radio.RADIO_STOP.clear()
-    yt_radio.PAUSED.clear()
-    yt_radio._FAILURE_BUDGET.reset()
-    yt_radio.PAUSE_INFO.clear()
-    yt_radio.LAST_TRACK_FAILURE.clear()
-    yield
-    yt_radio.PLAYLIST = saved["playlist"]
-    yt_radio.METADATA.clear()
-    yt_radio.METADATA.update(saved["metadata"])
-    yt_radio._CACHE.clear()
-    yt_radio._CACHE.update(saved["cache"])
-    yt_radio._cookies_recommended.clear()
-    yt_radio.RADIO_STOP.clear()
-    yt_radio.PAUSED.clear()
-    yt_radio._FAILURE_BUDGET.reset()
-    yt_radio.PAUSE_INFO.clear()
-    yt_radio.LAST_TRACK_FAILURE.clear()
-    with yt_radio.SUBSCRIBERS_LOCK:
-        yt_radio.SUBSCRIBERS.clear()
-    yt_radio.SUBSCRIBER_EVENT.clear()
-
-
 def _single_track_playlist():
     yt_radio.PLAYLIST = [TRACK_URL]
     yt_radio.METADATA[0] = {"title": "t", "artist": "a", "duration": 1, "id": "x"}
