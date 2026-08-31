@@ -22,3 +22,9 @@ PROJECT_ROOT = TESTS_DIR.parent
 
 os.environ["PLAYLIST_URL"] = str(TESTS_DIR / "fixtures" / "sample.radio")
 os.environ["CACHE_FILE"] = os.path.join(tempfile.gettempdir(), "yt-radio-test-cache.json")
+# Pin proxy credentials to unset so every test run starts in direct mode,
+# regardless of what the local .env contains (load_dotenv does not override
+# already-set variables). The proxied integration module opts back in
+# explicitly and spends paid quota only when run by hand.
+os.environ["DATAIMPULSE_USER"] = ""
+os.environ["DATAIMPULSE_PASS"] = ""

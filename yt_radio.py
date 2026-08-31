@@ -1,6 +1,6 @@
 from yt_dlp import YoutubeDL
 from file_util import _load_urls_from_file, _create_or_get_cache, _save_cache
-from transport import Transport
+from transport import Transport, build_dataimpulse_proxy_url, proxied_ydl_opts
 import json
 import threading
 import random
@@ -26,21 +26,41 @@ CACHE_FILE = os.environ.get("CACHE_FILE", "cache.json")
 RANDOMIZE_PLAYLIST = bool(os.environ.get("RANDOMIZE_PLAYLIST", "false"))
 META_INTERVAL_SECONDS = int(os.environ.get("META_INTERVAL_SECONDS", "5"))
 
+# Path to a cookies.txt file for YouTube auth. Required when YouTube bot-blocks
+# the server's IP — export cookies from a logged-in browser session.
+# When unset, yt-dlp runs without cookies (works from non-flagged IPs).
+COOKIES_FILE = os.environ.get("COOKIES_FILE")
+
+# --- Residential proxy (DataImpulse) -----------------------------------------
+# When both credentials are set, EVERY YouTube fetch (playlist listing,
+# per-track metadata, media streaming) rides the proxy, and COOKIES_FILE is
+# ignored on the proxied path (cookies exported through a different IP than
+# the proxy exit would be worse than none; the future bot-wall path — cookies
+# exported through the same proxy exit IP — is recorded but not built).
+# The URL is built at runtime from the credentials; never hardcode it.
+DATAIMPULSE_USER = os.environ.get("DATAIMPULSE_USER")
+DATAIMPULSE_PASS = os.environ.get("DATAIMPULSE_PASS")
+PROXY_URL = build_dataimpulse_proxy_url(DATAIMPULSE_USER, DATAIMPULSE_PASS)
+
 # yt-dlp format selection with fallback chain for resilience against
 # YouTube experiments that make pure audio-only formats unavailable.
 YTDLP_FORMAT = os.environ.get(
     "YTDLP_FORMAT", "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best"
 )
 
-# Path to a cookies.txt file for YouTube auth. Required when YouTube bot-blocks
-# the server's IP — export cookies from a logged-in browser session.
-# When unset, yt-dlp runs without cookies (works from non-flagged IPs).
-COOKIES_FILE = os.environ.get("COOKIES_FILE")
+# Proxied fetches cap the upstream audio at <=56 kbps (proxy egress is paid
+# per GB) with a graceful fallback chain if the capped tier is unavailable.
+PROXIED_FORMAT_CHAIN = "bestaudio[abr<=56]/bestaudio[abr<=96]/bestaudio"
 
 # The single transport object through which every yt-dlp / ffmpeg subprocess
 # spawn flows (see transport.py). yt-dlp is pinned to the venv's copy (run via
 # the venv interpreter); unit tests replace this object wholesale.
-TRANSPORT = Transport(cookies_file=COOKIES_FILE)
+TRANSPORT = Transport(cookies_file=COOKIES_FILE, proxy_url=PROXY_URL)
+if PROXY_URL:
+    logger.info(
+        "Residential proxy configured: all YouTube fetches ride the proxy "
+        "(one sticky session per track); COOKIES_FILE is ignored on the proxied path"
+    )
 
 # Optional one-shot: if yt-dlp is 403-blocked/bot-walled, point the
 # operator at COOKIES_FILE once so a persistent block doesn't spam every track.
@@ -99,6 +119,10 @@ def convert_playlist_to_links(link: str):
         "quiet": True,
         "extract_flat": True,
     }
+    if PROXY_URL:
+        # Playlist listing rides the proxy too, with the baseline's Python-API
+        # equivalents (rotating session is fine — no per-track identity here).
+        ydl_opts = proxied_ydl_opts(ydl_opts, PROXY_URL)
     urls = []
     logger.info("Starting conversion of playlist to links: %s", link)
     try:
@@ -180,7 +204,9 @@ def fetch_metadata(index, url):
 
     # Get metadata via yt-dlp
     try:
-        result = TRANSPORT.run_ytdlp(["--dump-json", url])
+        # sticky_key pins this fetch to the track's sticky proxy session so
+        # metadata extraction and the media download share one exit IP.
+        result = TRANSPORT.run_ytdlp(["--dump-json", url], sticky_key=url)
         if result.returncode != 0 or not result.stdout:
             logger.error("Failed to get metadata from yt-dlp, you may or may not be throttled!")
             _maybe_log_cookies_recommendation(result.stderr or "")
@@ -297,6 +323,15 @@ def ensure_metadata(index):
 
 
 
+def _media_format_selector():
+    """Format selector for the media path. Proxied fetches cap the upstream
+    audio at <=56 kbps (proxy egress is paid per GB) with a graceful fallback
+    chain; direct mode keeps the legacy format chain."""
+    if TRANSPORT.proxied:
+        return PROXIED_FORMAT_CHAIN
+    return YTDLP_FORMAT
+
+
 def _stream_track(index, url=None):
     if url is None:
         with PLAYLIST_LOCK:
@@ -311,7 +346,7 @@ def _stream_track(index, url=None):
     # Single transport seam: both children (yt-dlp | ffmpeg) are spawned and
     # owned by the transport; we only read the transcoded stdout.
     pipeline = TRANSPORT.open_track_pipeline(
-        url, ytdlp_format=YTDLP_FORMAT, bitrate_kbps=BITRATE_KBPS
+        url, ytdlp_format=_media_format_selector(), bitrate_kbps=BITRATE_KBPS
     )
 
     bytes_per_sec = (BITRATE_KBPS * 1000) // 8

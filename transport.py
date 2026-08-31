@@ -15,14 +15,97 @@ version-skew ghost failures.
 ffmpeg is still looked up on PATH (it is a system binary provisioned with the
 app, not a Python dependency) — only yt-dlp is venv-pinned.
 """
+import hashlib
 import subprocess
 import sys
 import tempfile
-from typing import NamedTuple
+import urllib.parse
+from typing import NamedTuple, Optional
 
 # Seconds before a synchronous metadata dump is abandoned. Matches the
 # previously hard-coded timeout; a hung yt-dlp must not stall the producer.
 YTDLP_METADATA_TIMEOUT = 30
+
+# --- Residential proxy (DataImpulse) ---------------------------------------
+# docs.dataimpulse.com: the HTTP gateway is gw.dataimpulse.com:823 (rotating);
+# sticky sessions are PORT-based — ports 10000-20000 hold one exit IP for
+# 1-120 minutes (default ~30). There is no sessid username parameter, so a
+# per-track sticky session is a deterministic sticky port derived from the
+# track URL: metadata extraction and the media download for one track use the
+# same port, hence the same exit IP.
+DATAIMPULSE_HOST = "gw.dataimpulse.com"
+DATAIMPULSE_ROTATING_PORT = 823
+STICKY_PORT_MIN = 10000
+STICKY_PORT_MAX = 20000
+
+# Mandated flag baseline for proxied invocations (issue 03): bounded chunk
+# size, modest retry budgets with backoff (never immediate retry loops), and
+# a bounded socket timeout. Applied only when the proxy is configured —
+# without credentials the app runs direct exactly as before.
+PROXIED_FLAG_BASELINE = [
+    "--http-chunk-size", "10M",
+    "--retries", "3",
+    "--fragment-retries", "3",
+    "--retry-sleep", "linear=1:30",
+    "--socket-timeout", "20",
+]
+# Metadata phase only: extraction gets a wider retry budget than downloads.
+PROXIED_EXTRACTOR_RETRIES = ["--extractor-retries", "5"]
+
+# Python-API (YoutubeDL) equivalents of the baseline, for the in-process
+# playlist listing. `linear=1:30` backoff has no clean API equivalent; the
+# retry budgets and timeouts still apply.
+PROXIED_YDL_API_OPTS = {
+    "http_chunk_size": 10 * 1024 * 1024,
+    "socket_timeout": 20,
+    "retries": 3,
+    "extractor_retries": 5,
+}
+
+
+def build_dataimpulse_proxy_url(user, password) -> Optional[str]:
+    """Build the rotating-gateway proxy URL from env credentials.
+
+    Returns None when either credential is missing — the caller then runs
+    direct. Credentials are URL-quoted so special characters cannot break
+    the URL. Never hardcode credentials anywhere else.
+    """
+    if not user or not password:
+        return None
+    quoted_user = urllib.parse.quote(str(user), safe="")
+    quoted_password = urllib.parse.quote(str(password), safe="")
+    return f"http://{quoted_user}:{quoted_password}@{DATAIMPULSE_HOST}:{DATAIMPULSE_ROTATING_PORT}"
+
+
+def sticky_port_for_track(track_key: str) -> int:
+    """Deterministic sticky port for a track (10000-20000). Same track key
+    always maps to the same port, so metadata + media share one exit IP."""
+    digest = hashlib.sha256(track_key.encode("utf-8")).digest()
+    value = int.from_bytes(digest[:8], "big")
+    return STICKY_PORT_MIN + value % (STICKY_PORT_MAX - STICKY_PORT_MIN + 1)
+
+
+def proxied_ydl_opts(opts: dict, proxy_url: str) -> dict:
+    """Apply the proxy and the mandated baseline's Python-API equivalents to
+    a YoutubeDL opts dict (returns a copy)."""
+    out = dict(opts)
+    out.update(PROXIED_YDL_API_OPTS)
+    out["proxy"] = proxy_url
+    return out
+
+
+def _sticky_proxy_url(proxy_url: str, track_key: str) -> str:
+    """Rewrite the proxy URL's port to the track's sticky port, preserving
+    credentials and host."""
+    parts = urllib.parse.urlsplit(proxy_url)
+    netloc = parts.hostname
+    if parts.username:
+        userinfo = parts.username
+        if parts.password:
+            userinfo += f":{parts.password}"
+        netloc = f"{userinfo}@{netloc}"
+    netloc = f"{netloc}:{sticky_port_for_track(track_key)}"
+    return urllib.parse.urlunsplit(parts._replace(netloc=netloc))
 
 
 class PipelineStderr(NamedTuple):
@@ -88,24 +171,55 @@ class TrackPipeline:
 
 
 class Transport:
-    """The one place where subprocesses are spawned. See module docstring."""
+    """The one place where subprocesses are spawned. See module docstring.
 
-    def __init__(self, cookies_file=None):
+    When `proxy_url` is set, every yt-dlp spawn rides the proxy and the
+    mandated flag baseline is applied; COOKIES_FILE is structurally excluded
+    (the argv builder has no branch that combines --proxy with --cookies).
+    When it is None, behaviour is exactly the pre-proxy direct mode.
+    """
+
+    def __init__(self, cookies_file=None, proxy_url=None):
         self.cookies_file = cookies_file
+        self.proxy_url = proxy_url
 
-    def yt_dlp_argv(self, args):
+    @property
+    def proxied(self) -> bool:
+        return self.proxy_url is not None
+
+    def yt_dlp_argv(self, args, sticky_key=None):
         """Full argv for a yt-dlp invocation: the venv interpreter running
-        the yt_dlp module — never a PATH binary."""
+        the yt_dlp module — never a PATH binary.
+
+        Fail-closed by construction: with a proxy configured, --proxy is on
+        every spawn, --cookies is unreachable, and a spawn without a
+        sticky_key is refused — per-track sticky sessions are the exit-IP
+        guarantee, so a silent fall back to the rotating gateway is not
+        allowed. Without a proxy, this is the direct argv exactly as before.
+        """
         argv = [sys.executable, "-m", "yt_dlp"]
-        if self.cookies_file:
+        if self.proxy_url:
+            if sticky_key is None:
+                raise ValueError(
+                    "sticky_key is required for proxied yt-dlp spawns — "
+                    "refusing to fetch without the track's sticky session"
+                )
+            argv += ["--proxy", _sticky_proxy_url(self.proxy_url, sticky_key)]
+            argv += PROXIED_FLAG_BASELINE
+        elif self.cookies_file:
             argv += ["--cookies", self.cookies_file]
         return argv + list(args)
 
-    def run_ytdlp(self, args, timeout=YTDLP_METADATA_TIMEOUT):
+    def run_ytdlp(self, args, timeout=YTDLP_METADATA_TIMEOUT, sticky_key=None):
         """Synchronous yt-dlp run (metadata dumps). Returns a CompletedProcess
-        with text stdout/stderr; raises subprocess.TimeoutExpired on timeout."""
+        with text stdout/stderr; raises subprocess.TimeoutExpired on timeout.
+        `sticky_key` (a track URL) pins the spawn to that track's sticky
+        session so metadata and media share one exit IP."""
+        argv = self.yt_dlp_argv(args, sticky_key=sticky_key)
+        if self.proxy_url:
+            argv += PROXIED_EXTRACTOR_RETRIES
         return subprocess.run(
-            self.yt_dlp_argv(args),
+            argv,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -125,7 +239,7 @@ class Transport:
         ffmpeg_err = tempfile.TemporaryFile()
 
         ytdlp = subprocess.Popen(
-            self.yt_dlp_argv(["-f", ytdlp_format, "-o", "-", url]),
+            self.yt_dlp_argv(["-f", ytdlp_format, "-o", "-", url], sticky_key=url),
             stdout=subprocess.PIPE,
             stderr=ytdlp_err,
         )

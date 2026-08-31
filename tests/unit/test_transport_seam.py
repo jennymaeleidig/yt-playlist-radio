@@ -74,14 +74,15 @@ class FakeTransport:
     open_track_pipeline call; `results` scripts run_ytdlp outcomes.
     """
 
-    def __init__(self, pipelines=(), results=None, spawn_error=None):
+    def __init__(self, pipelines=(), results=None, spawn_error=None, proxied=False):
         self._pipelines = list(pipelines)
         self._results = list(results or [])
         self._spawn_error = spawn_error
+        self.proxied = proxied
         self.pipeline_opens = 0
         self.run_ytdlp_calls = 0
 
-    def run_ytdlp(self, args, timeout=None):
+    def run_ytdlp(self, args, timeout=None, sticky_key=None):
         self.run_ytdlp_calls += 1
         if self._results:
             return self._results.pop(0)
