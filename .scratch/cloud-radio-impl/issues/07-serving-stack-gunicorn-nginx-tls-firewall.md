@@ -4,7 +4,7 @@
 
 **Blocked by:** 06, 05 (SMTP/msmtp configured during provisioning).
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] gunicorn systemd unit: single worker, streaming-safe timeout, `Restart=always` + `RestartSec`, memory caps, `After=network-online.target`
 - [ ] nginx proxies loopback → public; buffering disabled on the stream location
