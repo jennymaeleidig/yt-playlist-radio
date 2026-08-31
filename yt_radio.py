@@ -2,9 +2,12 @@ from yt_dlp import YoutubeDL
 from file_util import _load_urls_from_file, _create_or_get_cache, _save_cache
 from transport import Transport, build_dataimpulse_proxy_url, proxied_ydl_opts
 import json
+import re
+import sys
 import threading
 import random
 import os
+from collections import deque
 from dotenv import load_dotenv
 import logging
 import time
@@ -25,6 +28,38 @@ PLAYLIST_URL = os.environ.get("PLAYLIST_URL")
 CACHE_FILE = os.environ.get("CACHE_FILE", "cache.json")
 RANDOMIZE_PLAYLIST = bool(os.environ.get("RANDOMIZE_PLAYLIST", "false"))
 META_INTERVAL_SECONDS = int(os.environ.get("META_INTERVAL_SECONDS", "5"))
+
+# --- Cost guardrails (issue 04) ----------------------------------------------
+# The supervisor must stop retry-storming and stop spending on systemic
+# failure. Consecutive track failures back off exponentially; the failure
+# budget (5 consecutive, or 5 within a 10-minute rolling window) pauses the
+# loop entirely; a 407 TRAFFIC_EXHAUSTED proxy response is terminal — pause
+# immediately, zero retries.
+FAILURE_BUDGET_CONSECUTIVE = 5
+FAILURE_BUDGET_WINDOW_FAILURES = 5
+FAILURE_BUDGET_WINDOW_MINUTES = 10
+FAILURE_BUDGET_WINDOW_SECONDS = FAILURE_BUDGET_WINDOW_MINUTES * 60
+
+# Backoff for the nth consecutive failure: base * 2^(n-1), capped.
+BACKOFF_BASE_SECONDS = float(os.environ.get("TRACK_FAILURE_BACKOFF_BASE_SECONDS", "2"))
+BACKOFF_MAX_SECONDS = float(os.environ.get("TRACK_FAILURE_BACKOFF_MAX_SECONDS", "60"))
+
+# While paused the loop polls this often for a resume or shutdown.
+PAUSE_POLL_SECONDS = 5.0
+
+# yt-dlp stderr patterns for a terminal proxy traffic-exhaustion response.
+# Deliberately stricter than a bare "407" substring: byte counts, URLs and
+# track ids often contain "407", and this pause is terminal — false
+# positives are costly.
+TRAFFIC_EXHAUSTED_PATTERNS = (
+    re.compile(r"HTTP Error 407"),
+    re.compile(r"\b407\s+Proxy"),
+    re.compile(r"TRAFFIC_EXHAUSTED"),
+)
+
+# How much of the failing spawn's stderr is kept for the pause path
+# (issue 05 alerting consumes this).
+STDERR_EXCERPT_CHARS = 2000
 
 # Path to a cookies.txt file for YouTube auth. Required when YouTube bot-blocks
 # the server's IP — export cookies from a logged-in browser session.
@@ -101,6 +136,9 @@ SUBSCRIBERS = {}  # sid -> Queue[bytes]
 SUBSCRIBERS_LOCK = threading.Lock()
 RADIO_THREAD = None
 RADIO_STOP = threading.Event()
+# Set when a guardrail pauses the supervisor: the loop then spends nothing
+# (no spawns, no metadata fetches) until resume_radio().
+PAUSED = threading.Event()
 SUBSCRIBER_EVENT = threading.Event()
 
 CHUNK_SIZE = 8192
@@ -323,6 +361,167 @@ def ensure_metadata(index):
 
 
 
+# --- Cost guardrails implementation ------------------------------------------
+
+class TrackFailure(RuntimeError):
+    """A track failed: yt-dlp exited nonzero (its exit code — NEVER ffmpeg's
+    — decides). Carries yt-dlp's stderr so the failure budget and pause path
+    can record why the track died."""
+
+    def __init__(self, message, ytdlp_returncode=None, ytdlp_stderr=""):
+        super().__init__(message)
+        self.ytdlp_returncode = ytdlp_returncode
+        self.ytdlp_stderr = ytdlp_stderr or ""
+
+
+class FailureBudget:
+    """The failure budget: the supervisor pauses once 5 consecutive track
+    failures happen, or 5 failures land inside a 10-minute rolling window —
+    even with successes in between. The clock is injectable so the window
+    behaviour is deterministic under test."""
+
+    def __init__(self, max_consecutive=FAILURE_BUDGET_CONSECUTIVE,
+                 window_failures=FAILURE_BUDGET_WINDOW_FAILURES,
+                 window_seconds=FAILURE_BUDGET_WINDOW_SECONDS,
+                 clock=time.monotonic):
+        self._max_consecutive = max_consecutive
+        self._window_failures = window_failures
+        self._window_seconds = window_seconds
+        self._clock = clock
+        self._consecutive = 0
+        self._timestamps = deque()
+
+    def record_failure(self):
+        self._consecutive += 1
+        now = self._clock()
+        self._timestamps.append(now)
+        self._expire(now)
+
+    def record_success(self):
+        self._consecutive = 0
+
+    def exhausted(self):
+        now = self._clock()
+        self._expire(now)
+        return (
+            self._consecutive >= self._max_consecutive
+            or len(self._timestamps) >= self._window_failures
+        )
+
+    def _expire(self, now):
+        while self._timestamps and now - self._timestamps[0] > self._window_seconds:
+            self._timestamps.popleft()
+
+    def consecutive_failures(self):
+        return self._consecutive
+
+    def failures_in_window(self):
+        return len(self._timestamps)
+
+    def reset(self):
+        self._consecutive = 0
+        self._timestamps.clear()
+
+
+def backoff_delay(consecutive_failures: int) -> float:
+    """Exponential backoff before the nth consecutive retry: base * 2^(n-1),
+    capped. Replaces the old fixed ~1s retry sleep — a run of failures must
+    slow down, not retry-storm."""
+    return min(
+        BACKOFF_BASE_SECONDS * (2 ** max(consecutive_failures - 1, 0)),
+        BACKOFF_MAX_SECONDS,
+    )
+
+
+# Guardrail state, reset by resume_radio() and by the test fixture.
+_FAILURE_BUDGET = FailureBudget()
+PAUSE_INFO = {}         # reason + counters + stderr excerpt for the pause path
+LAST_TRACK_FAILURE = {}  # url / yt-dlp exit code / full stderr of the last failure
+
+
+def _traffic_exhausted(ytdlp_stderr) -> bool:
+    """True when yt-dlp's stderr shows the proxy refusing with 407 (traffic
+    exhausted / out of credit). Terminal: no retries of any kind."""
+    stderr = ytdlp_stderr or ""
+    return any(pattern.search(stderr) for pattern in TRAFFIC_EXHAUSTED_PATTERNS)
+
+
+def _pause_radio(reason: str, stderr: str = "") -> None:
+    """Pause the supervisor: the loop spends nothing until resume_radio().
+    Captures the counters and the failing spawn's stderr excerpt so the pause
+    path (and issue 05's alerting) can say why the radio stopped."""
+    if PAUSED.is_set():
+        return
+    PAUSE_INFO.clear()
+    PAUSE_INFO.update({
+        "reason": reason,
+        "stderr_excerpt": (stderr or "").strip()[:STDERR_EXCERPT_CHARS],
+        "consecutive_failures": _FAILURE_BUDGET.consecutive_failures(),
+        "failures_in_window": _FAILURE_BUDGET.failures_in_window(),
+        "paused_at": time.time(),
+    })
+    PAUSED.set()
+    logger.error("RADIO PAUSED: %s | last yt-dlp stderr: %s", reason, PAUSE_INFO["stderr_excerpt"])
+
+
+def resume_radio() -> None:
+    """Resume the supervisor loop with a fresh failure budget."""
+    PAUSED.clear()
+    PAUSE_INFO.clear()
+    _FAILURE_BUDGET.reset()
+    logger.info("Radio resumed with a fresh failure budget")
+
+
+def _record_track_success() -> None:
+    """A track that completed with yt-dlp exit 0 resets the consecutive
+    failure counter (the rolling window keeps counting)."""
+    _FAILURE_BUDGET.record_success()
+
+
+def _handle_track_failure(ytdlp_stderr="", *, ytdlp_returncode=None, url=None) -> None:
+    """Record one track failure and apply the cost guardrails. Order matters:
+    a traffic-exhausted proxy response pauses immediately (zero retries — no
+    backoff sleep); otherwise the failure budget decides between exponential
+    backoff and pausing."""
+    _FAILURE_BUDGET.record_failure()
+    LAST_TRACK_FAILURE.clear()
+    LAST_TRACK_FAILURE.update({
+        "url": url,
+        "ytdlp_returncode": ytdlp_returncode,
+        "stderr": ytdlp_stderr or "",
+        "at": time.time(),
+    })
+    if _traffic_exhausted(ytdlp_stderr):
+        _pause_radio(
+            "traffic exhausted: proxy returned 407 TRAFFIC_EXHAUSTED — "
+            "pausing immediately, zero retries",
+            ytdlp_stderr,
+        )
+        return
+    if _FAILURE_BUDGET.exhausted():
+        _pause_radio(
+            "failure budget exhausted "
+            "({} consecutive / {} in {} min)".format(
+                _FAILURE_BUDGET.consecutive_failures(),
+                _FAILURE_BUDGET.failures_in_window(),
+                FAILURE_BUDGET_WINDOW_MINUTES,
+            ),
+            ytdlp_stderr,
+        )
+        return
+    _backoff_after_failure(_FAILURE_BUDGET.consecutive_failures())
+
+
+def _backoff_after_failure(consecutive_failures: int) -> None:
+    """Sleep out the exponential backoff delay (interruptible by shutdown)."""
+    delay = backoff_delay(consecutive_failures)
+    logger.warning(
+        "Track failure %d: backing off %.0fs before the next attempt",
+        consecutive_failures, delay,
+    )
+    RADIO_STOP.wait(delay)
+
+
 def _media_format_selector():
     """Format selector for the media path. Proxied fetches cap the upstream
     audio at <=56 kbps (proxy egress is paid per GB) with a graceful fallback
@@ -353,6 +552,9 @@ def _stream_track(index, url=None):
     burst_bytes = bytes_per_sec * BURST_SECONDS
     bytes_sent = 0
     start_time = time.monotonic()
+    # Set when the consumer abandons the stream early (shutdown, no
+    # subscribers): the pipeline is then torn down, not classified.
+    interrupted = False
 
     try:
         while True:
@@ -370,8 +572,13 @@ def _stream_track(index, url=None):
             if bytes_sent > expected_bytes:
                 sleep_for = (bytes_sent - expected_bytes) / bytes_per_sec
                 time.sleep(sleep_for)
+    except GeneratorExit:
+        interrupted = True
+        raise
     finally:
-        # close() kills + reaps both children and drains their stderr.
+        # close() waits out (then kills + reaps) both children and drains
+        # their stderr. yt-dlp's exit code decides failure — ffmpeg's is
+        # deliberately ignored.
         ffmpeg_err, ytdlp_err = pipeline.close()
         elapsed = time.monotonic() - start_time
         logger.info("Finished sending [%d/%d]: %r - %r (bytes_sent=%d, elapsed=%.2fs)", index + 1, len(PLAYLIST), meta.get("artist"), meta.get("title"), bytes_sent, elapsed)
@@ -383,6 +590,21 @@ def _stream_track(index, url=None):
                 _maybe_log_cookies_recommendation(ytdlp_err)
         except Exception:
             logger.exception("Failed to log subprocess stderr")
+        ytdlp_rc = pipeline.ytdlp_returncode
+        # Only classify clean natural completions: if the read loop itself
+        # raised, let the original exception propagate (sys.exc_info() is
+        # set while an exception is in flight) — the loop still budgets it,
+        # but the real traceback survives.
+        if (
+            not interrupted
+            and sys.exc_info()[0] is None
+            and ytdlp_rc not in (None, 0)
+        ):
+            raise TrackFailure(
+                "yt-dlp exited {} for track {}".format(ytdlp_rc, index),
+                ytdlp_returncode=ytdlp_rc,
+                ytdlp_stderr=ytdlp_err,
+            )
 
 
 def add_subscriber():
@@ -422,6 +644,13 @@ def broadcast_chunk(track_index: int, chunk: bytes):
 def _radio_loop():
     played = []
     while not RADIO_STOP.is_set():
+        if PAUSED.is_set():
+            # Cost guardrail: while paused the supervisor spends nothing —
+            # no spawns, no metadata fetches. Wake periodically to notice
+            # resume_radio() or shutdown.
+            if RADIO_STOP.wait(PAUSE_POLL_SECONDS):
+                break
+            continue
         if not SUBSCRIBER_EVENT.wait(timeout=1):
             continue
         with PLAYLIST_LOCK:
@@ -439,18 +668,42 @@ def _radio_loop():
         played.append(index)
         url = playlist_snapshot[index]
         try:
-            for chunk in _stream_track(index, url):
-                if RADIO_STOP.is_set():
-                    break
-                with SUBSCRIBERS_LOCK:
-                    if not SUBSCRIBERS:
-                        logger.info("No subscribers remaining; stopping track early")
+            # stream.close() delivers GeneratorExit synchronously when the
+            # loop abandons the track early, so the interrupted flag below is
+            # set deterministically before the outcome is classified.
+            interrupted = False
+            stream = _stream_track(index, url)
+            try:
+                for chunk in stream:
+                    if RADIO_STOP.is_set():
+                        interrupted = True
                         break
-                broadcast_chunk(index, chunk)
+                    with SUBSCRIBERS_LOCK:
+                        if not SUBSCRIBERS:
+                            logger.info("No subscribers remaining; stopping track early")
+                            interrupted = True
+                            break
+                    broadcast_chunk(index, chunk)
+            finally:
+                stream.close()
+            if interrupted:
+                continue
+            # Natural completion with yt-dlp exit 0: a real success.
+            _record_track_success()
+        except TrackFailure as failure:
+            logger.warning(
+                "Track failed (yt-dlp exit %s): %s", failure.ytdlp_returncode, failure
+            )
+            _handle_track_failure(
+                failure.ytdlp_stderr,
+                ytdlp_returncode=failure.ytdlp_returncode,
+                url=url,
+            )
         except Exception:
-            logger.exception("Error in radio producer, skipping track")
-            time.sleep(1)
-            continue
+            # Spawn-level failure (e.g. the proxy is unreachable): no yt-dlp
+            # exit code exists, but it costs exactly like a failed track.
+            logger.exception("Error in radio producer, treating as a track failure")
+            _handle_track_failure("", url=url)
 
 
 def ensure_radio_running():

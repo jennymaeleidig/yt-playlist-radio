@@ -115,16 +115,32 @@ class PipelineStderr(NamedTuple):
     ytdlp: str
 
 
-def _reap(proc):
-    """Kill and wait out a child process, tolerating anything."""
+# Seconds to wait for yt-dlp to exit on its own at close() before killing it.
+# Its stdout EOF is what normally ends the stream, so it has usually exited
+# already; the grace wait lets close() capture its REAL exit code instead of
+# a kill signal. Cost guardrails key on this code (see yt_radio.TrackFailure).
+YTDLP_EXIT_GRACE_SECONDS = 2.0
+
+
+def _reap(proc, wait_timeout=0.0):
+    """Wait out a child (up to `wait_timeout` seconds), then kill and wait.
+    Returns the child's exit code: the real one if it exited inside the wait
+    window, a negative signal value if it had to be killed, or None if the
+    code could not be obtained. Tolerates anything."""
+    if wait_timeout > 0:
+        try:
+            return proc.wait(timeout=wait_timeout)
+        except Exception:
+            pass
     try:
         proc.kill()
     except Exception:
         pass
     try:
-        proc.wait()
+        proc.wait(timeout=10)
     except Exception:
         pass
+    return proc.returncode
 
 
 class TrackPipeline:
@@ -144,6 +160,21 @@ class TrackPipeline:
         self._ytdlp_err = ytdlp_err
         self._ffmpeg_err = ffmpeg_err
         self._closed = False
+        self._ytdlp_returncode = None
+        self._ffmpeg_returncode = None
+
+    @property
+    def ytdlp_returncode(self):
+        """yt-dlp's exit code, meaningful after close(). Failure decisions
+        key on THIS code — never on ffmpeg's."""
+        return self._ytdlp_returncode
+
+    @property
+    def ffmpeg_returncode(self):
+        """ffmpeg's exit code, meaningful after close(). Deliberately not
+        used for failure decisions: ffmpeg's failures mirror yt-dlp's or are
+        irrelevant (early teardown)."""
+        return self._ffmpeg_returncode
 
     def close(self) -> PipelineStderr:
         """Kill and reap both children; return their captured stderr
@@ -151,8 +182,10 @@ class TrackPipeline:
         if self._closed:
             return PipelineStderr("", "")
         self._closed = True
-        _reap(self.ffmpeg)
-        _reap(self.ytdlp)
+        # Reap yt-dlp first with a short grace wait so its real exit code is
+        # captured; ffmpeg is killed outright (nothing keys on its code).
+        self._ytdlp_returncode = _reap(self.ytdlp, wait_timeout=YTDLP_EXIT_GRACE_SECONDS)
+        self._ffmpeg_returncode = _reap(self.ffmpeg)
         texts = []
         for err_file in (self._ffmpeg_err, self._ytdlp_err):
             text = ""

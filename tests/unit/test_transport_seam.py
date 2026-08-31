@@ -43,11 +43,16 @@ class FakePipeline:
     `chunks` is the media stream ffmpeg would emit; an empty list is a
     dead track (immediate EOF). `read_delay` simulates a slow track.
     `stderr_texts` is what close() reports as (ffmpeg_stderr, ytdlp_stderr).
+    `ytdlp_returncode` / `ffmpeg_returncode` are the exit codes close()
+    surfaces — the guardrails key on yt-dlp's, never ffmpeg's.
     """
 
-    def __init__(self, chunks=(), read_delay=0.0, stderr_texts=("", "")):
+    def __init__(self, chunks=(), read_delay=0.0, stderr_texts=("", ""),
+                 ytdlp_returncode=0, ffmpeg_returncode=0):
         self.stdout = _DelayedReader(io.BytesIO(b"".join(chunks)), read_delay)
         self._stderr_texts = stderr_texts
+        self.ytdlp_returncode = ytdlp_returncode
+        self.ffmpeg_returncode = ffmpeg_returncode
         self.close_calls = 0
 
     def close(self):
@@ -81,6 +86,11 @@ class FakeTransport:
         self.proxied = proxied
         self.pipeline_opens = 0
         self.run_ytdlp_calls = 0
+
+    def add_pipeline(self, pipeline):
+        """Queue another scripted outcome for tests that extend the script
+        mid-flight (e.g. resume-after-pause)."""
+        self._pipelines.append(pipeline)
 
     def run_ytdlp(self, args, timeout=None, sticky_key=None):
         self.run_ytdlp_calls += 1
